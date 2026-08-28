@@ -1663,6 +1663,20 @@ DEFAULT_CONFIG = {
         # override for backward compatibility. 0 disables the reap
         # (park forever).
         "ws_orphan_reap_grace_s": 20.0,
+        # Keep-alive chat PTY lifetime (seconds). A Chat-tab connect with a
+        # known ?attach= token replays instantly while its server-side PTY is
+        # alive; once the PTY has been detached longer than this TTL it is
+        # reaped and the next connect re-spawns `hermes --tui`, which re-loads
+        # conversation history — the slow path mobile users hit after leaving
+        # the dashboard idle. Raise the TTL to keep sessions warm longer
+        # (24h covers an overnight gap). 0 reaps on the first reaper tick
+        # after detach. Capacity is unchanged: a full registry still evicts
+        # the oldest idle session to make room. Read at dashboard startup.
+        "pty_session_ttl_s": 1800.0,
+        # Replay ring-buffer size per keep-alive chat PTY, in bytes: the most
+        # recent terminal output replayed to a reconnecting terminal. Affects
+        # sessions spawned after the dashboard (re)start.
+        "pty_buffer_cap": 1048576,
         # Startup sweep of session rows orphaned by a dead gateway process
         # (#65194).  The ws-orphan grace timer above is in-process, so a
         # gateway restart (update, crash, systemd) leaves disconnected

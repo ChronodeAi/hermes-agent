@@ -155,6 +155,19 @@ class PtySessionRegistry:
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
 
+    def configure(self, *, ttl: Optional[float] = None,
+                  buffer_cap: Optional[int] = None) -> None:
+        """Apply runtime overrides (dashboard config) to the live registry.
+
+        Only the TTL takes effect for sessions that already exist (the reaper
+        reads it each sweep); ``buffer_cap`` applies to PTYs spawned after the
+        change. Never raises.
+        """
+        if ttl is not None:
+            self._ttl = max(0.0, float(ttl))
+        if buffer_cap is not None:
+            self._buffer_cap = max(1, int(buffer_cap))
+
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
         await self.reap_idle()

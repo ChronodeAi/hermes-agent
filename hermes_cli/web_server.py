@@ -458,6 +458,19 @@ async def _lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
+    # Apply dashboard config to the keep-alive PTY registry before the reaper
+    # starts (dashboard.pty_session_ttl_s / dashboard.pty_buffer_cap).
+    try:
+        _pty_cfg = load_config() or {}
+        PTY_REGISTRY.configure(
+            ttl=cfg_get(_pty_cfg, "dashboard", "pty_session_ttl_s",
+                        default=30 * 60),
+            buffer_cap=cfg_get(_pty_cfg, "dashboard", "pty_buffer_cap",
+                               default=1 * 1024 * 1024),
+        )
+    except Exception:
+        _log.warning("Failed to apply dashboard PTY keep-alive config", exc_info=True)
+
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
 
