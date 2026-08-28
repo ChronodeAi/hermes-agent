@@ -160,6 +160,11 @@ function terminalTierWidthPx(host: HTMLElement | null): number {
   return Math.max(1, Math.round(layout));
 }
 
+// Touch scroll sensitivity for the xterm pane on touch devices: CSS px of
+// finger drag consumed per terminal row (lower = faster). 3 ≈ 2.5× a 1:1
+// drag feel — tuned for flicking through long transcripts on phones.
+const TOUCH_SCROLL_PX_PER_ROW = 3;
+
 function terminalFontSizeForWidth(layoutWidthPx: number): number {
   if (layoutWidthPx < 300) return 7;
   if (layoutWidthPx < 360) return 8;
@@ -319,6 +324,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       return next;
     });
   }, []);
+
   const { setEnd, setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
     scope: string;
@@ -807,6 +813,62 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ev.stopPropagation();
       return false;
     });
+
+    // Touch devices (iOS Safari/Brave): xterm has no native touch scrolling,
+    // so a finger drag does nothing. Bridge single-finger drags into
+    // scrollLines — parity with the wheel bridge above — and preventDefault
+    // so the drag never escapes to the page. Two-finger gestures are left
+    // alone for browser zoom.
+    let touchScrollCleanup: (() => void) | null = null;
+    {
+      let touchId: number | null = null;
+      let lastY = 0;
+      let accumulated = 0;
+      const onTouchStart = (ev: TouchEvent) => {
+        if (ev.touches.length !== 1) {
+          touchId = null;
+          return;
+        }
+        touchId = ev.touches[0].identifier;
+        lastY = ev.touches[0].clientY;
+        accumulated = 0;
+      };
+      const onTouchMove = (ev: TouchEvent) => {
+        if (
+          touchId === null ||
+          ev.touches.length !== 1 ||
+          ev.touches[0].identifier !== touchId
+        ) {
+          return;
+        }
+        const y = ev.touches[0].clientY;
+        const dy = lastY - y;
+        lastY = y;
+        if (dy === 0) {
+          return;
+        }
+        accumulated += dy;
+        const rows = Math.trunc(accumulated / TOUCH_SCROLL_PX_PER_ROW);
+        if (rows !== 0) {
+          term.scrollLines(rows);
+          accumulated -= rows * TOUCH_SCROLL_PX_PER_ROW;
+        }
+        ev.preventDefault();
+      };
+      const onTouchEnd = () => {
+        touchId = null;
+      };
+      host.addEventListener("touchstart", onTouchStart, { passive: true });
+      host.addEventListener("touchmove", onTouchMove, { passive: false });
+      host.addEventListener("touchend", onTouchEnd);
+      host.addEventListener("touchcancel", onTouchEnd);
+      touchScrollCleanup = () => {
+        host.removeEventListener("touchstart", onTouchStart);
+        host.removeEventListener("touchmove", onTouchMove);
+        host.removeEventListener("touchend", onTouchEnd);
+        host.removeEventListener("touchcancel", onTouchEnd);
+      };
+    }
 
     const unicode11 = new Unicode11Addon();
     term.loadAddon(unicode11);
@@ -1507,6 +1569,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       onScrollDisposable?.dispose();
+      touchScrollCleanup?.();
       mobileInputCleanup?.();
       compositionForwarder.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);
