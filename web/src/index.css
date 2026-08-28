@@ -8,6 +8,16 @@
 @import '@nous-research/ui/styles/fonts.css';
 @import '@nous-research/ui/styles/globals.css';
 
+/* Mobile Safari: kill pull-to-refresh / rubber-band on the root scroller so
+   a downward drag at the top of a page doesn't reload the dashboard.
+   Inner scroll containers (xterm pane, lists) are unaffected — they set
+   their own overscroll-contain. Requires iOS 16+ (Safari 16 added
+   overscroll-behavior support). */
+html,
+body {
+    overscroll-behavior-y: none;
+}
+
 /* Scan the published design-system bundle so its utility classes survive
    Tailwind's JIT purge. */
 @source '../node_modules/@nous-research/ui/dist';
