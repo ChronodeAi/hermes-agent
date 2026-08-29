@@ -2701,6 +2701,128 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+# ── Death-spiral guard (2026-08-29 gateway incident) ────────────────────
+# A ~900k-token session whose summary route keeps timing out / getting
+# commit-fence-cancelled re-enters compress_context every turn. Each attempt
+# deep-copies and serializes the full context, and the C-level regex/str work
+# holds the GIL long enough to starve web_server.py's event loop (observed
+# "event loop stalled 25.3s", WS heartbeat timeouts, reconnect storms).
+#
+# Two bounds close the spiral:
+#   1. SIZE GUARD — refuse to START a new attempt when the estimated token
+#      count implies a serialization cost beyond the hard-truncation ceiling.
+#      The attempt cannot possibly finish within the host budget, so running
+#      it only burns the event loop.
+#   2. ABORT-AND-TRUNCATE — after N consecutive commit-fence aborts for the
+#      same session (persisted in state.db via the abort-streak counter), stop
+#      retrying and hard-truncate the durable middle window instead. The
+#      counter resets on a successful commit (clear_compression_abort_streak).
+_COMPRESSION_ABORT_LIMIT = 2
+_COMPRESSION_SIZE_GUARD_TOKENS = 1_400_000
+_DEATH_SPIRAL_TRUNCATE_MARKER = "[compression-abort-streak:]"
+
+
+def _death_spiral_guard(
+    agent: Any,
+    lock_db: Any,
+    session_id: str,
+    approx_tokens: Optional[int],
+) -> None:
+    """Called after a commit-fence abort. Runs the hard-truncate fallback when
+    the consecutive-abort streak reaches :data:`_COMPRESSION_ABORT_LIMIT`, or
+    refuses oversized sessions from re-serializing at all.
+
+    Never raises — this runs on the compression host path; a guard failure
+    must degrade to the historical abort-and-retry behavior.
+    """
+    try:
+        db = lock_db
+        if db is None:
+            return
+        # 1. Size guard: an unboundedly serializable context must not start.
+        est = int(approx_tokens or 0)
+        if (
+            est > _COMPRESSION_SIZE_GUARD_TOKENS
+            and not getattr(agent, "_compression_death_spiral_exempt", False)
+        ):
+            _abort_streak = db.get_compression_abort_streak(session_id)
+            logger.error(
+                "compression refused: session=%s estimated_tokens=%d exceeds "
+                "the serialization size guard (%d); run /compress on a "
+                "smaller session or /new — refusing to serialize an "
+                "unbounded context on the gateway process",
+                session_id, est, _COMPRESSION_SIZE_GUARD_TOKENS,
+            )
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=time.monotonic(),
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="serialization_size_guard",
+            )
+            return
+        # 2. Abort-and-truncate fallback.
+        streak = db.record_compression_abort(
+            session_id, "commit_fence_cancelled"
+        )
+        if streak < _COMPRESSION_ABORT_LIMIT:
+            return
+        logger.error(
+            "compression death spiral detected: session=%s has aborted %d "
+            "consecutive attempts — forcing a hard truncation instead of a "
+            "3rd attempt",
+            session_id, streak,
+        )
+        try:
+            agent._emit_warning(
+                "⚠ Context compression aborted "
+                f"{streak} times for this session. Forcing a hard truncation "
+                "of the oldest middle messages to keep the session usable — "
+                "archived history remains searchable."
+            )
+        except Exception:
+            pass
+        # The abort happened before durable lock acquisition (fence cancelled
+        # before lock setup), so no lease is held for this session — the
+        # truncate must not require one, or a stale-lock refusal would defeat
+        # the fallback exactly when it is needed. Under the existing lock
+        # protocol this call is serialized against any concurrent compressor
+        # because it runs on the same compress host path that just failed.
+        kept = db.hard_truncate_middle_window(
+            session_id,
+            target_tokens=int(getattr(agent.context_compressor, "threshold_tokens", 0) or 0),
+            lock_holder=None,
+        )
+        db.clear_compression_abort_streak(session_id)
+        # Force a live-context reload so the caller's in-memory transcript
+        # re-baselines onto the truncated durable set on the next turn.
+        agent._last_flushed_db_idx = 0
+        agent._compression_warning = (
+            "⚠ Session context was hard-truncated after repeated compression "
+            "failures. Oldest middle messages were archived (still "
+            "searchable); run /new for a clean session."
+        )
+        logger.warning(
+            "death-spiral hard truncation committed for session=%s "
+            "(active_messages_after=%d)",
+            session_id, kept,
+        )
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=time.monotonic(),
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="death_spiral_hard_truncate",
+        )
+    except Exception:
+        logger.warning(
+            "death-spiral guard failed for session=%s — degrading to the "
+            "historical abort-and-retry behavior",
+            session_id,
+            exc_info=True,
+        )
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -3049,6 +3171,7 @@ def compress_context(
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
                     )
+                    _death_spiral_guard(agent, _lock_db, _lock_sid, approx_tokens)
                     _complete_compaction_lifecycle(force_terminal=True)
                     return messages, _existing_sp
             try:
@@ -4673,6 +4796,16 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status == "committed" and _lock_db is not None:
+            # Death-spiral guard: a successful commit resets the consecutive
+            # abort counter so a later bad streak starts from zero.
+            try:
+                _lock_db.clear_compression_abort_streak(_lock_sid)
+            except Exception:
+                logger.debug(
+                    "compression abort-streak clear failed for session=%s",
+                    _lock_sid, exc_info=True,
+                )
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

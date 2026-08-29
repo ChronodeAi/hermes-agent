@@ -3860,6 +3860,12 @@ class CompressionSessionClosedError(RuntimeError):
         )
 
 
+# Marker embedded in sessions.compression_failure_error by
+# record_compression_abort(); the trailing integer is the consecutive
+# commit-fence abort count read by get_compression_abort_streak().
+_COMPRESSION_ABORT_MARKER = "[compression-abort-streak:]"
+
+
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
@@ -7780,6 +7786,237 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 session_id, exc,
             )
             return False
+
+    # ── Death-spiral guard (2026-08-29 gateway incident) ────────────────
+    # A session whose summary model keeps timing out / getting fence-cancelled
+    # re-serializes its multi-hundred-K-token context on every retry, starving
+    # the gateway event loop. Compression failure counts are persisted so the
+    # consecutive-abort counter survives process restarts.
+
+    def get_compression_abort_streak(self, session_id: str) -> int:
+        """Consecutive commit-fence aborts recorded for *session_id*."""
+        if not session_id:
+            return 0
+        try:
+            row = self.get_compression_failure_cooldown_row(session_id)
+        except Exception:
+            return 0
+        if not row or not row.get("session_exists"):
+            return 0
+        error = row.get("error") or ""
+        if _COMPRESSION_ABORT_MARKER not in error:
+            return 0
+        try:
+            return int(error.rsplit(_COMPRESSION_ABORT_MARKER, 1)[1].strip().split()[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def record_compression_abort(self, session_id: str, error: str) -> int:
+        """Increment the consecutive-abort counter; returns the new value."""
+        if not session_id:
+            return 0
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            current = 0
+            if row is not None:
+                existing_error = (
+                    row["compression_failure_error"]
+                    if isinstance(row, sqlite3.Row) else row[1]
+                ) or ""
+                marker = _COMPRESSION_ABORT_MARKER
+                if marker in existing_error:
+                    try:
+                        current = int(
+                            existing_error.rsplit(marker, 1)[1].strip().split()[0]
+                        )
+                    except (ValueError, IndexError):
+                        current = 0
+            new_count = current + 1
+            conn.execute(
+                "UPDATE sessions SET compression_failure_error = ? WHERE id = ?",
+                (f"{error} {marker} {new_count}", session_id),
+            )
+            return new_count
+
+        return int(self._execute_write(_do) or 0)
+
+    def clear_compression_abort_streak(self, session_id: str) -> None:
+        """Reset the consecutive-abort counter (on a successful commit)."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            existing = (
+                row["compression_failure_error"]
+                if isinstance(row, sqlite3.Row) else row[0]
+            )
+            if existing and _COMPRESSION_ABORT_MARKER in existing:
+                conn.execute(
+                    "UPDATE sessions SET compression_failure_error = NULL "
+                    "WHERE id = ?",
+                    (session_id,),
+                )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.debug(
+                "clear_compression_abort_streak(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def hard_truncate_middle_window(
+        self,
+        session_id: str,
+        *,
+        target_tokens: int,
+        protect_head: int = 4,
+        protect_tail_tokens: int = 20000,
+        lock_holder: Optional[str] = None,
+        reason: str = "compression_death_spiral_guard",
+    ) -> int:
+        """Emergency compaction: drop the middle of the conversation until the
+        active transcript is under *target_tokens*.
+
+        This is the terminal fallback when repeated compression attempts abort
+        (commit-fence cancelled / summary timeout): instead of looping, the
+        oldest middle-window messages are soft-archived (active=0, still on
+        disk + FTS-searchable) in ONE transaction and a truncation marker is
+        inserted at the drop boundary. History is never destroyed — archived
+        rows stay recoverable via ``get_messages(include_inactive=True)``.
+
+        Alternation-safe: the first kept row is always a user/assistant
+        boundary row (archiving never starts on a tool row); a boundary
+        user summary marker is inserted so the surviving transcript opens
+        with an explanation instead of a dangling tool result.
+
+        Uses the same lease protocol as ``archive_and_compact``: when
+        *lock_holder* is given the commit verifies the holder still owns the
+        compression lock, refusing a stale publish. Returns the new active
+        message count, or 0 when the lease was lost / the session is unknown.
+        """
+        if not session_id:
+            return 0
+
+        def _do(conn):
+            if lock_holder is not None:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or (
+                        lock_row["holder"] if isinstance(lock_row, sqlite3.Row)
+                        else lock_row[0]
+                    ) != lock_holder
+                    or float(
+                        lock_row["expires_at"] if isinstance(lock_row, sqlite3.Row)
+                        else lock_row[1]
+                    ) <= time.time()
+                ):
+                    raise SessionCompressionInProgressError(
+                        f"Compression lease for {session_id!r} lost before "
+                        "hard-truncate commit; refusing a stale publish"
+                    )
+            rows = conn.execute(
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                return 0
+            # Walk rows accumulating rough token cost; keep the newest tail
+            # whose cumulative cost fits protect_tail_tokens, and enough of
+            # the oldest head rows to preserve the opening exchange.
+            head_ids: list[int] = []
+            head_cost = 0
+            head_scan = 0
+            for row in rows:
+                head_scan += 1
+                cost = max(1, len(row["content"] or "") // 4)
+                head_cost += cost
+                head_ids.append(row["id"])
+                if head_scan >= protect_head:
+                    break
+            tail_ids_rev: list[int] = []
+            tail_cost = 0
+            for row in reversed(rows):
+                rid = row["id"]
+                if rid in set(head_ids):
+                    break
+                cost = max(1, len(row["content"] or "") // 4)
+                if tail_cost + cost > protect_tail_tokens and tail_ids_rev:
+                    break
+                tail_cost += cost
+                tail_ids_rev.append(rid)
+            tail_ids = list(reversed(tail_ids_rev))
+            # If the kept head + tail already fit the target, nothing to drop.
+            keep = set(head_ids) | set(tail_ids)
+            middle = [r["id"] for r in rows if r["id"] not in keep]
+            if not middle:
+                return conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchone()[0]
+            marker = (
+                "[SYSTEM: Context truncation — the session exceeded its "
+                "compression threshold and repeated automatic compaction "
+                "attempts aborted, so the oldest middle portion of this "
+                f"conversation ({len(middle)} messages) was archived to keep "
+                "the session responsive. Nothing was deleted; use session "
+                "search to recover details.]"
+            )
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            max_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE messages SET active = 0 WHERE id IN (%s)"
+                % ",".join("?" for _ in middle),
+                tuple(middle),
+            )
+            conn.execute(
+                "INSERT INTO messages "
+                "(id, session_id, role, content, active, timestamp, compacted) "
+                "VALUES (?, ?, 'user', ?, 1, ?, 1)",
+                (max_id + 1, session_id, marker, now_iso),
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = "
+                "(SELECT COUNT(*) FROM messages WHERE session_id = ? "
+                "AND active = 1), "
+                "compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? "
+                "WHERE id = ?",
+                (
+                    session_id,
+                    time.time() + 900,
+                    f"{reason}: truncated {len(middle)} messages at {now_iso}",
+                    session_id,
+                ),
+            )
+            return conn.execute(
+                "SELECT COUNT(*) FROM messages "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()[0]
+
+        return int(self._execute_write(_do) or 0)
 
     def try_acquire_compression_lock(
         self,

@@ -24,8 +24,10 @@ import json
 import logging
 import sqlite3
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -4928,7 +4930,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._previous_summary = _redact_compaction_text(self._previous_summary)
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        from agent._compression_serialize_offload import (
+            _serialize_for_summary_out_of_process,
+        )
+        content_to_summarize = _serialize_for_summary_out_of_process(
+            self, turns_to_summarize
+        )
         # P2 ghost-skill defense (#32106): [SKILL_PRUNED: ...] markers entering
         # the summarizer are prompt INPUT only — LLMs routinely paraphrase them
         # into vague prose ("some skills were loaded"), which erases the reload
