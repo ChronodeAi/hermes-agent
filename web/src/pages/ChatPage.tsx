@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { ArrowDown, ArrowUp, ChevronUp, Keyboard, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronUp, Keyboard, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -1630,6 +1630,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (isTerminalControlTraffic(combined)) {
           return;
         }
+        if (narrow) {
+          // Mobile: the composer is the sole text entry, so Ink never needs
+          // CSI/OSC sequences as input. Strip ALL of them — batched mouse
+          // reports and terminal queries otherwise land in the TUI composer
+          // as phantom letters (the "llll" bug: each \x1b[?1000l in a
+          // concatenated burst contributes its trailing byte). The key bar
+          // sends real menu keys via raw ws.send, bypassing this filter.
+          const stripped = combined
+            .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC … BEL/ST
+            .replace(/\x1b\[[0-9;?<=>!]*[ -/]*[@-~]/g, "") // CSI … final byte
+            .replace(/\x1b[@-Z\\-_]/g, ""); // leftover 2-byte ESC sequences
+          if (!stripped) {
+            return;
+          }
+          ingestPtyData(stripped, useMobileReplacement);
+          return;
+        }
         if (/^\x1b/.test(combined) && combined.length <= 16) {
           // ESC-prefixed and short: potentially the first half of a split
           // control sequence. Hold it briefly; if no continuation arrives,
@@ -2151,6 +2168,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                   className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
                 >
                   <Keyboard className="h-4 w-4" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\x18")}
+                  aria-label="Remove selected queued message (Ctrl+X)"
+                  title="Remove queued (Ctrl+X)"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <Trash2 className="h-4 w-4" />
                 </Button>
                 <span className="ml-auto pr-1 text-[0.625rem] uppercase tracking-wide text-text-secondary/60">
                   tap to navigate menus
