@@ -239,6 +239,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
   const mobileReplacementInputUntilRef = useRef(0);
+  // Hold buffer for possibly-split terminal control sequences (see the
+  // reassembly note inside the PTY input forwarder).
+  const ESC_PENDING_MS = 30;
+  const escPendingRef = useRef("");
+  const escFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [ptyState, setPtyState] =
     useState<PtyConnectionState>("connecting");
   const ptyStateRef = useRef<PtyConnectionState>("connecting");
@@ -1609,10 +1614,40 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         FOCUS_EVENT_RE.test(data) ||
         PRIVATE_MODE_RE.test(data) ||
         DSR_RESPONSE_RE.test(data);
+      // Reassembly: control sequences can arrive split across WebSocket
       const forwardPtyData = (data: string, useMobileReplacement = true) => {
-        // Mouse reports (scroll wheel etc.) are not typed input — swallow
-        // them before the blocked-input check so scrolling a disconnected
-        // terminal doesn't trip the "reconnecting" notice.
+        // chunks. A fragment (e.g. the trailing "l" of mouse-off
+        // \x1b[?1000l) evades whole-chunk filters and lands in the TUI as
+        // typed text — the phantom-letter bug. Hold a short ESC-prefixed
+        // chunk briefly; either the next chunk completes a known sequence
+        // (swallowed) or the held bytes flush as real input.
+        const combined = escPendingRef.current + data;
+        if (escFlushTimerRef.current) {
+          clearTimeout(escFlushTimerRef.current);
+          escFlushTimerRef.current = null;
+        }
+        escPendingRef.current = "";
+        if (isTerminalControlTraffic(combined)) {
+          return;
+        }
+        if (/^\x1b/.test(combined) && combined.length <= 16) {
+          // ESC-prefixed and short: potentially the first half of a split
+          // control sequence. Hold it briefly; if no continuation arrives,
+          // flush it as real input (a bare ESC keystroke also rides this
+          // path — the delay is imperceptible).
+          escPendingRef.current = combined;
+          escFlushTimerRef.current = setTimeout(() => {
+            escFlushTimerRef.current = null;
+            const held = escPendingRef.current;
+            escPendingRef.current = "";
+            if (held) ingestPtyData(held, useMobileReplacement);
+          }, ESC_PENDING_MS);
+          return;
+        }
+        ingestPtyData(combined, useMobileReplacement);
+      };
+
+      const ingestPtyData = (data: string, useMobileReplacement: boolean) => {
         if (isTerminalControlTraffic(data)) {
           return;
         }
@@ -2029,6 +2064,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                     }
                   }}
                   rows={1}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  spellCheck={false}
                   placeholder="Message, /commands, or menu keys"
                   className={cn(
                     "max-h-24 min-h-[2.25rem] flex-1 resize-none rounded border border-current/20",
