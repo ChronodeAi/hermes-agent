@@ -528,13 +528,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     focusChatTarget();
   };
 
-  // Interrupt the running turn: ESC is the TUI's interrupt binding
-  // (ui-tui useInputHandlers — key.escape aborts the turn). Sent as its
-  // own stdin write so it lands as a keypress, never coalesced.
+  // Interrupt the running turn: the TUI's interrupt-while-streaming
+  // binding is Ctrl+C (resolveCtrlCComposerAction → 'interrupt' when the
+  // composer is empty — and on mobile the draft lives in the web
+  // composer, not the TUI's, so it is always empty here). Sent as its own
+  // stdin write so it lands as one keypress. A bare ESC is NOT the
+  // interrupt binding (single Esc is a no-op; double-Esc discards draft).
   const handleInterrupt = () => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send("\x1b");
+    ws.send("\x03");
     focusChatTarget();
   };
 
@@ -1963,8 +1966,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 ghost
                 size="icon"
                 onClick={handleInterrupt}
-                aria-label="Interrupt the running turn (Esc)"
-                title="Interrupt (Esc)"
+                aria-label="Interrupt the running turn (Ctrl+C)"
+                title="Interrupt (Ctrl+C)"
                 className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
               >
                 <Square className="h-4 w-4" />
