@@ -19638,6 +19638,46 @@ def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str
     return trusted
 
 
+def _install_sighup_resilience() -> bool:
+    """Ignore stray SIGHUP deliveries to the headless dashboard/serve backend.
+
+    The backend runs under launchd (or as the desktop app's child) with no
+    controlling terminal, yet stray SIGHUP deliveries (terminal session
+    teardowns, process-group cleanup sweeps) silently terminate it — the
+    default SIGHUP disposition — dropping every dashboard WS session until
+    launchd keepalive respawns it ~1s later (2026-08-29 incident: silent
+    deaths at 17:03:56 / 17:29:02 local with no traceback in errors.log,
+    each blipping the iPhone dashboard).
+
+    Nothing in the dashboard protocol uses SIGHUP: ``dashboard_procs`` stops
+    the backend via SIGTERM → SIGKILL, mirroring the cmd_update SIGHUP →
+    SIG_IGN guard. So log the delivery with an attribution stack and keep
+    serving. Main thread only; safe to call more than once.
+    """
+    import signal as _signal
+    import threading as _threading
+    import traceback as _tb
+
+    if not hasattr(_signal, "SIGHUP"):
+        return False
+    if _threading.current_thread() is not _threading.main_thread():
+        return False
+
+    def _on_sighup(signum, frame):
+        _log.warning(
+            "dashboard backend received SIGHUP — ignored (headless; stop via "
+            "SIGTERM). attribution stack:\n%s",
+            "".join(_tb.format_stack(frame)),
+        )
+
+    try:
+        _signal.signal(_signal.SIGHUP, _on_sighup)
+        return True
+    except (ValueError, OSError, RuntimeError) as exc:
+        _log.debug("SIGHUP resilience handler not installed: %s", exc)
+        return False
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -19913,6 +19953,12 @@ def start_server(
         install_exit_flush_signal_handlers()
     except Exception as exc:
         _log.debug("exit-flush signal handlers not installed: %s", exc)
+
+    # Stray SIGHUP silently killed the dashboard backend twice on 2026-08-29
+    # (default SIGHUP disposition = terminate; see _install_sighup_resilience).
+    # Installed before uvicorn's capture_signals(), which only captures
+    # SIGINT/SIGTERM and leaves this handler live for the process lifetime.
+    _install_sighup_resilience()
 
     # ── #93608: machine-readable port-conflict detection ──────────────
     # uvicorn's own bind_socket() would catch the EADDRINUSE and exit 1
