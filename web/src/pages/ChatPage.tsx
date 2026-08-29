@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { ArrowDown, ArrowUp, ChevronUp, Keyboard, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronUp, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -541,16 +541,40 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // the live turn (steer mode is the dashboard default) or queues it when
   // idle. Newlines collapse: each "\n" is a composer submit, so a burst
   // would submit fragments as separate turns.
+  //
+  // Slash drafts take a per-character burst: iOS fires ONE input event
+  // for a fast-typed string, so a single write would reach Ink as a blob
+  // and its slash-completion menu would never open. Chars at 25ms ride
+  // Ink's per-keystroke tokenizer (same mechanism as the /copy burst);
+  // the menu then opens on the terminal and the key bar navigates it.
+  const sendBurstChars = (text: string) => {
+    const chars = Array.from(text);
+    chars.forEach((c, i) => {
+      setTimeout(() => {
+        const s = wsRef.current;
+        if (s && s.readyState === WebSocket.OPEN) s.send(c);
+      }, i * 25);
+    });
+    setTimeout(() => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+    }, chars.length * 25 + 60);
+  };
+
   const handleComposerSend = () => {
     const text = composerDraft.replace(/\s*\n\s*/g, " ").trim();
     if (!text) return;
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(text);
-    setTimeout(() => {
-      const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
-    }, 100);
+    if (text.startsWith("/")) {
+      sendBurstChars(text);
+    } else {
+      ws.send(text);
+      setTimeout(() => {
+        const s = wsRef.current;
+        if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+      }, 100);
+    }
     setComposerDraft("");
     focusChatTarget();
   };
@@ -563,7 +587,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!text) return;
     sendSlashBurst(`/queue ${text}`);
     setComposerDraft("");
-    composerSentLenRef.current = 0;
     focusChatTarget();
   };
 
@@ -574,25 +597,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(bytes);
-  };
-
-  // Live slash transmission: while the draft starts with "/", every
-  // keystroke is forwarded immediately (no Enter) so the TUI's own
-  // autocomplete/permission UI opens on the terminal and the key bar
-  // navigates it. Non-slash drafts wait for Send/Queue as usual.
-  const composerSentLenRef = useRef(0);
-  const handleComposerChange = (value: string) => {
-    setComposerDraft(value);
-    if (/^\//.test(value)) {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const delta = value.slice(composerSentLenRef.current);
-        if (delta) ws.send(delta);
-      }
-      composerSentLenRef.current = value.length;
-    } else {
-      composerSentLenRef.current = 0;
-    }
   };
 
   useEffect(() => {
@@ -2068,7 +2072,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 <textarea
                   ref={composerInputRef}
                   value={composerDraft}
-                  onChange={(e) => handleComposerChange(e.target.value)}
+                  onChange={(e) => setComposerDraft(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
@@ -2158,16 +2162,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                   className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
                 >
                   <X className="h-4 w-4" />
-                </Button>
-                <Button
-                  ghost
-                  size="icon"
-                  onClick={() => sendPtyBytes("\t")}
-                  aria-label="Tab (autocomplete)"
-                  title="⇥"
-                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
-                >
-                  <Keyboard className="h-4 w-4" />
                 </Button>
                 <Button
                   ghost
