@@ -351,6 +351,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : false,
   );
 
+  // On touch layouts (narrow) the terminal never takes keyboard focus:
+  // the iOS software keyboard has no Esc and typing belongs in the
+  // composer below the terminal. Programmatic terminal focus becomes a
+  // no-op there, so reconnects/resumes never pop the keyboard into the
+  // CLI; the composer is the only text entry.
+  const focusChatTarget = useCallback(() => {
+    if (narrow) return;
+    termRef.current?.focus();
+  }, [narrow]);
+
   const { theme } = useTheme();
   const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
   const terminalFg = theme.terminalForeground ?? DEFAULT_TERMINAL_FOREGROUND;
@@ -515,7 +525,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setCopyState("copied");
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-    termRef.current?.focus();
+    focusChatTarget();
   };
 
   // Interrupt the running turn: ESC is the TUI's interrupt binding
@@ -525,7 +535,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send("\x1b");
-    termRef.current?.focus();
+    focusChatTarget();
   };
 
   // Queue a message: written to the PTY exactly like typed input (burst
@@ -545,7 +555,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (s && s.readyState === WebSocket.OPEN) s.send("\r");
     }, 100);
     setComposerDraft("");
-    termRef.current?.focus();
+    focusChatTarget();
   };
 
   useEffect(() => {
@@ -856,6 +866,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // so the drag never escapes to the page. Two-finger gestures are left
     // alone for browser zoom.
     let touchScrollCleanup: (() => void) | null = null;
+    let touchFocusCleanup: (() => void) | null = null;
     {
       let touchId: number | null = null;
       let lastY = 0;
@@ -904,6 +915,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         host.removeEventListener("touchend", onTouchEnd);
         host.removeEventListener("touchcancel", onTouchEnd);
       };
+
+      // Touch layout: never let the terminal canvas capture focus. A tap
+      // synthesizes a mousedown that focuses xterm's hidden helper
+      // textarea and pops the software keyboard into the CLI. Swallow the
+      // touchend once every finger is up (drags/scrolls are unaffected);
+      // the composer below is the text entry.
+      if (narrow) {
+        const swallowTapFocus = (ev: TouchEvent) => {
+          if (ev.touches.length > 0) return;
+          ev.preventDefault();
+        };
+        host.addEventListener("touchend", swallowTapFocus, { passive: false });
+        touchFocusCleanup = () =>
+          host.removeEventListener("touchend", swallowTapFocus);
+      }
     }
 
     const unicode11 = new Unicode11Addon();
@@ -1606,6 +1632,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onResizeDisposable?.dispose();
       onScrollDisposable?.dispose();
       touchScrollCleanup?.();
+      touchFocusCleanup?.();
       mobileInputCleanup?.();
       compositionForwarder.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);
@@ -1719,7 +1746,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           host !== null &&
           !host.contains(active);
         if (!focusIsElsewhereInChatPage) {
-          termRef.current?.focus();
+          focusChatTarget();
         }
       });
     });
