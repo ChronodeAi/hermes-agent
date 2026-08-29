@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronUp, Keyboard, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -558,7 +558,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!text) return;
     sendSlashBurst(`/queue ${text}`);
     setComposerDraft("");
+    composerSentLenRef.current = 0;
     focusChatTarget();
+  };
+
+  // Raw PTY keystrokes for the mobile key bar. Overlay menus (permission
+  // prompts, clarify pickers, slash autocomplete) are terminal menus —
+  // touch users have no arrow keys, so the bar emits the real bytes.
+  const sendPtyBytes = (bytes: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(bytes);
+  };
+
+  // Live slash transmission: while the draft starts with "/", every
+  // keystroke is forwarded immediately (no Enter) so the TUI's own
+  // autocomplete/permission UI opens on the terminal and the key bar
+  // navigates it. Non-slash drafts wait for Send/Queue as usual.
+  const composerSentLenRef = useRef(0);
+  const handleComposerChange = (value: string) => {
+    setComposerDraft(value);
+    if (/^\//.test(value)) {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const delta = value.slice(composerSentLenRef.current);
+        if (delta) ws.send(delta);
+      }
+      composerSentLenRef.current = value.length;
+    } else {
+      composerSentLenRef.current = 0;
+    }
   };
 
   useEffect(() => {
@@ -1565,11 +1594,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // behave normally.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+      // Terminal-originated control traffic that must never reach the PTY
+      // as typed text. The embedded chat has a known stray-input bug class
+      // (letters appearing in the TUI composer); these are all the report
+      // shapes xterm can emit through onData. Deliberately NOT filtered:
+      // real keystrokes (arrows \x1b[A-D, Home/End \x1b[FH, paging \x1b[5~).
+      const X10_MOUSE_RE = /^\x1b\[M[\s\S]{0,3}$/;
+      const FOCUS_EVENT_RE = /^\x1b\[(I|O)$/;
+      const PRIVATE_MODE_RE = /^\x1b\[\?[\d;]*[hl]$/;
+      const DSR_RESPONSE_RE = /^\x1b\[[0-9;]*R$/;
+      const isTerminalControlTraffic = (data: string) =>
+        SGR_MOUSE_RE.test(data) ||
+        X10_MOUSE_RE.test(data) ||
+        FOCUS_EVENT_RE.test(data) ||
+        PRIVATE_MODE_RE.test(data) ||
+        DSR_RESPONSE_RE.test(data);
       const forwardPtyData = (data: string, useMobileReplacement = true) => {
         // Mouse reports (scroll wheel etc.) are not typed input — swallow
         // them before the blocked-input check so scrolling a disconnected
         // terminal doesn't trip the "reconnecting" notice.
-        if (SGR_MOUSE_RE.test(data)) {
+        if (isTerminalControlTraffic(data)) {
           return;
         }
 
@@ -1602,7 +1646,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // normal onData path.
       sendComposedText = (data) => forwardPtyData(data, false);
       onDataDisposable = term.onData((data) => {
-        if (!SGR_MOUSE_RE.test(data)) {
+        if (!isTerminalControlTraffic(data)) {
           compositionForwarder.noteTerminalData(data);
         }
         forwardPtyData(data);
@@ -1957,57 +2001,123 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           />
 
           {narrow && (
-            <div className="flex shrink-0 items-end gap-2 border-t border-current/20 px-1 pt-2">
-              <Button
-                ghost
-                size="icon"
-                onClick={handleInterrupt}
-                aria-label="Interrupt the running turn (Ctrl+C)"
-                title="Interrupt (Ctrl+C)"
-                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+            <div className="shrink-0 border-t border-current/20 px-1 pt-2">
+              <div className="flex items-end gap-2">
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={handleInterrupt}
+                  aria-label="Interrupt the running turn (Ctrl+C)"
+                  title="Interrupt (Ctrl+C)"
+                  className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <Square className="h-4 w-4" />
+                </Button>
+                <textarea
+                  ref={composerInputRef}
+                  value={composerDraft}
+                  onChange={(e) => handleComposerChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      handleComposerSend();
+                    } else if (e.key === "Backspace" && /^\//.test(composerDraft)) {
+                      // Live-slash mode transmits per keystroke; backspaces
+                      // must reach the TUI composer too. \x7f is delete-
+                      // backward; xterm sends this natively for Backspace.
+                      sendPtyBytes("\x7f");
+                    }
+                  }}
+                  rows={1}
+                  placeholder="Message, /commands, or menu keys"
+                  className={cn(
+                    "max-h-24 min-h-[2.25rem] flex-1 resize-none rounded border border-current/20",
+                    "bg-black/30 px-2 py-1.5 text-sm text-midground",
+                    "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
+                  )}
+                />
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={handleComposerQueue}
+                  disabled={!composerDraft.trim()}
+                  aria-label="Queue message for next turn"
+                  title="Queue (doesn't steer the live turn)"
+                  className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <ListPlus className="h-4 w-4" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={handleComposerSend}
+                  disabled={!composerDraft.trim()}
+                  aria-label="Send / steer message"
+                  title={/^\//.test(composerDraft) ? "Confirm command (Enter)" : "Send (Enter)"}
+                  className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <SendHorizonal className="h-4 w-4" />
+                </Button>
+              </div>
+              <div
+                className="flex items-center gap-1 pb-1 pt-1.5"
+                role="toolbar"
+                aria-label="Terminal menu keys"
               >
-                <Square className="h-4 w-4" />
-              </Button>
-              <textarea
-                ref={composerInputRef}
-                value={composerDraft}
-                onChange={(e) => setComposerDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    handleComposerSend();
-                  }
-                }}
-                rows={1}
-                placeholder="Message the agent (queues while busy)"
-                className={cn(
-                  "max-h-24 min-h-[2.25rem] flex-1 resize-none rounded border border-current/20",
-                  "bg-black/30 px-2 py-1.5 text-sm text-midground",
-                  "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
-                )}
-              />
-              <Button
-                ghost
-                size="icon"
-                onClick={handleComposerQueue}
-                disabled={!composerDraft.trim()}
-                aria-label="Queue message for next turn"
-                title="Queue (doesn't steer the live turn)"
-                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
-              >
-                <ListPlus className="h-4 w-4" />
-              </Button>
-              <Button
-                ghost
-                size="icon"
-                onClick={handleComposerSend}
-                disabled={!composerDraft.trim()}
-                aria-label="Send / queue message"
-                title="Send (Enter)"
-                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
-              >
-                <SendHorizonal className="h-4 w-4" />
-              </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\x1b[A")}
+                  aria-label="Up (menu previous)"
+                  title="▲"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <ArrowUp className="h-4 w-4" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\x1b[B")}
+                  aria-label="Down (menu next)"
+                  title="▼"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <ArrowDown className="h-4 w-4" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\r")}
+                  aria-label="Enter (confirm selection)"
+                  title="⏎"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <ChevronUp className="h-4 w-4 rotate-90" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\x1b")}
+                  aria-label="Escape (dismiss menu)"
+                  title="⎋"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  onClick={() => sendPtyBytes("\t")}
+                  aria-label="Tab (autocomplete)"
+                  title="⇥"
+                  className="h-8 w-8 shrink-0 text-text-secondary hover:text-midground"
+                >
+                  <Keyboard className="h-4 w-4" />
+                </Button>
+                <span className="ml-auto pr-1 text-[0.625rem] uppercase tracking-wide text-text-secondary/60">
+                  tap to navigate menus
+                </span>
+              </div>
             </div>
           )}
 
