@@ -646,8 +646,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const handleComposerChange = (value: string) => {
     setComposerDraft(value);
     if (slashDebounceRef.current) clearTimeout(slashDebounceRef.current);
-    if (value.startsWith("/")) {
-      slashDebounceRef.current = setTimeout(() => fetchSlashCompletions(value), 90);
+    // Any "/token" under the caret — line-initial commands AND mid-message
+    // skill references (the CLI completes both; Hermes resolves a skill
+    // reference anywhere in prose). The last whitespace-delimited word
+    // decides; a trailing space closes the menu.
+    const lastWord = value.split(/\s+/u).pop() ?? "";
+    if (/^\/\S*$/u.test(lastWord)) {
+      slashDebounceRef.current = setTimeout(() => fetchSlashCompletions(lastWord), 90);
     } else {
       slashReqSeqRef.current++;
       setSlashCompletions([]);
