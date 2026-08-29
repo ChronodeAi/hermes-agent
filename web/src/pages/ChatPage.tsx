@@ -25,6 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
+import { GatewayClient } from "@/lib/gatewayClient";
 import { ArrowDown, ArrowUp, ChevronUp, ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -588,6 +589,75 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     sendSlashBurst(`/queue ${text}`);
     setComposerDraft("");
     focusChatTarget();
+  };
+
+  // Slash autocomplete: the composer queries complete.slash directly over
+  // the JSON-RPC sidecar (same dispatcher the Ink TUI uses) and renders
+  // its own tap-to-fill menu. The PTY path cannot show Ink's menu live on
+  // iOS — fast typing arrives as one input event — so the menu lives here.
+  type SlashCompletionItem = { text: string; display?: string; meta?: string; kind?: string };
+  const composerGwRef = useRef<GatewayClient | null>(null);
+  const composerGwConnectingRef = useRef<Promise<void> | null>(null);
+  const slashDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const slashReqSeqRef = useRef(0);
+  const [slashCompletions, setSlashCompletions] = useState<SlashCompletionItem[]>([]);
+
+  const ensureComposerGateway = useCallback(async () => {
+    if (composerGwRef.current) return composerGwRef.current;
+    if (!composerGwConnectingRef.current) {
+      const gw = new GatewayClient();
+      composerGwConnectingRef.current = gw
+        .connect()
+        .then(() => {
+          composerGwRef.current = gw;
+        })
+        .catch(() => {
+          // Leave null — the next keystroke retries.
+        })
+        .finally(() => {
+          composerGwConnectingRef.current = null;
+        });
+    }
+    await composerGwConnectingRef.current;
+    return composerGwRef.current;
+  }, []);
+
+  const fetchSlashCompletions = useCallback(
+    (draft: string) => {
+      const seq = ++slashReqSeqRef.current;
+      void (async () => {
+        try {
+          const gw = await ensureComposerGateway();
+          if (!gw) return;
+          const res = await gw.request<{ items?: SlashCompletionItem[] }>(
+            "complete.slash",
+            { text: draft },
+          );
+          if (seq !== slashReqSeqRef.current) return;
+          setSlashCompletions((res?.items ?? []).slice(0, 8));
+        } catch {
+          if (seq === slashReqSeqRef.current) setSlashCompletions([]);
+        }
+      })();
+    },
+    [ensureComposerGateway],
+  );
+
+  const handleComposerChange = (value: string) => {
+    setComposerDraft(value);
+    if (slashDebounceRef.current) clearTimeout(slashDebounceRef.current);
+    if (value.startsWith("/")) {
+      slashDebounceRef.current = setTimeout(() => fetchSlashCompletions(value), 90);
+    } else {
+      slashReqSeqRef.current++;
+      setSlashCompletions([]);
+    }
+  };
+
+  const acceptSlashCompletion = (item: SlashCompletionItem) => {
+    setComposerDraft(item.text.startsWith("/") ? item.text : `/${item.text}`);
+    setSlashCompletions([]);
+    composerInputRef.current?.focus();
   };
 
   // Raw PTY keystrokes for the mobile key bar. Overlay menus (permission
@@ -2069,32 +2139,63 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 >
                   <Square className="h-4 w-4" />
                 </Button>
-                <textarea
-                  ref={composerInputRef}
-                  value={composerDraft}
-                  onChange={(e) => setComposerDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleComposerSend();
-                    } else if (e.key === "Backspace" && /^\//.test(composerDraft)) {
-                      // Live-slash mode transmits per keystroke; backspaces
-                      // must reach the TUI composer too. \x7f is delete-
-                      // backward; xterm sends this natively for Backspace.
-                      sendPtyBytes("\x7f");
-                    }
-                  }}
-                  rows={1}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  placeholder="Message, /commands, or menu keys"
-                  className={cn(
-                    "max-h-24 min-h-[2.25rem] flex-1 resize-none rounded border border-current/20",
-                    "bg-black/30 px-2 py-1.5 text-sm text-midground",
-                    "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
+                <div className="relative min-w-0 flex-1">
+                  {slashCompletions.length > 0 && (
+                    <div
+                      className={cn(
+                        "absolute bottom-full left-0 right-0 z-20 mb-1",
+                        "rounded border border-current/20 bg-black/90 shadow-lg backdrop-blur",
+                      )}
+                      role="listbox"
+                      aria-label="Slash command completions"
+                    >
+                      {slashCompletions.map((item) => (
+                        <button
+                          key={item.text}
+                          type="button"
+                          onClick={() => acceptSlashCompletion(item)}
+                          className={cn(
+                            "flex w-full items-baseline gap-2 px-2.5 py-1.5 text-left text-sm",
+                            "text-midground hover:bg-midground/10",
+                          )}
+                        >
+                          <span className="font-medium">{item.display || item.text}</span>
+                          {item.meta ? (
+                            <span className="truncate text-xs text-text-secondary/80">
+                              {item.meta}
+                            </span>
+                          ) : null}
+                          {item.kind === "skill" ? (
+                            <span className="ml-auto shrink-0 rounded border border-current/20 px-1 text-[0.625rem] uppercase tracking-wide text-text-secondary/70">
+                              skill
+                            </span>
+                          ) : null}
+                        </button>
+                      ))}
+                    </div>
                   )}
-                />
+                  <textarea
+                    ref={composerInputRef}
+                    value={composerDraft}
+                    onChange={(e) => handleComposerChange(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleComposerSend();
+                      }
+                    }}
+                    rows={1}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    placeholder="Message, /commands, or menu keys"
+                    className={cn(
+                      "max-h-24 min-h-[2.25rem] w-full resize-none rounded border border-current/20",
+                      "bg-black/30 px-2 py-1.5 text-sm text-midground",
+                      "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
+                    )}
+                  />
+                </div>
                 <Button
                   ghost
                   size="icon"
