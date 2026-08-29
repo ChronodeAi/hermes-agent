@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
+import { ListPlus, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -222,14 +222,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
       : null,
   );
-  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
-  // Mobile composer: lets touch devices interrupt the running turn and
-  // queue a message without summoning the on-screen keyboard into the
-  // terminal itself. ESC (interrupt) and typed-while-busy (queue) are the
-  // TUI's own bindings — the buttons drive the same paths as a keyboard.
+  // Mobile composer: touch entry for interrupt / send / queue. The
+  // buttons drive the TUI's own paths (Ctrl+C interrupt, typed input,
+  // the /queue command) — no parallel protocol.
   const [composerDraft, setComposerDraft] = useState("");
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
-  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const forceFreshPtyRef = useRef(false);
@@ -509,23 +506,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
-  const handleCopyLast = () => {
+  // Send a slash command burst then Return — the same timing pattern the
+  // PTY needs for Ink to tokenize each keystroke (not coalesce a paste):
+  // 100ms is safely past Node's default stdin coalescing window.
+  const sendSlashBurst = (command: string) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Send the slash as a burst, wait long enough for Ink's tokenizer to
-    // emit a keypress event for each character (not coalesce them into a
-    // paste), then send Return as its own event.  The timing here is
-    // empirical — 100ms is safely past Node's default stdin coalescing
-    // window and well inside UI responsiveness.
-    ws.send("/copy");
+    ws.send(command);
     setTimeout(() => {
       const s = wsRef.current;
       if (s && s.readyState === WebSocket.OPEN) s.send("\r");
     }, 100);
-    setCopyState("copied");
-    if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-    focusChatTarget();
   };
 
   // Interrupt the running turn: the TUI's interrupt-while-streaming
@@ -541,12 +532,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     focusChatTarget();
   };
 
-  // Queue a message: written to the PTY exactly like typed input (burst
-  // then Return, same timing as handleCopyLast). While the agent is busy
-  // the TUI composer queues the text and drains it when the turn ends —
-  // the same queue the desktop app's queued messages land in. Newlines
-  // are collapsed: a multi-line burst risks the middle lines submitting
-  // as separate early submissions (each "\n" is a composer submit).
+  // Send (steer): plain typed input — while busy the TUI injects it into
+  // the live turn (steer mode is the dashboard default) or queues it when
+  // idle. Newlines collapse: each "\n" is a composer submit, so a burst
+  // would submit fragments as separate turns.
   const handleComposerSend = () => {
     const text = composerDraft.replace(/\s*\n\s*/g, " ").trim();
     if (!text) return;
@@ -557,6 +546,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       const s = wsRef.current;
       if (s && s.readyState === WebSocket.OPEN) s.send("\r");
     }, 100);
+    setComposerDraft("");
+    focusChatTarget();
+  };
+
+  // Queue: drives the TUI's /queue command (composer.enqueue) so the
+  // message always lands in the queue — never steers the live turn, even
+  // mid-stream. Same queue `desktop`'s queued messages drain from.
+  const handleComposerQueue = () => {
+    const text = composerDraft.replace(/\s*\n\s*/g, " ").trim();
+    if (!text) return;
+    sendSlashBurst(`/queue ${text}`);
     setComposerDraft("");
     focusChatTarget();
   };
@@ -1667,10 +1667,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
-      if (copyResetRef.current) {
-        clearTimeout(copyResetRef.current);
-        copyResetRef.current = null;
-      }
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -1957,7 +1953,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         >
           <div
             ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1 touch-none"
           />
 
           {narrow && (
@@ -1990,6 +1986,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                   "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
                 )}
               />
+              <Button
+                ghost
+                size="icon"
+                onClick={handleComposerQueue}
+                disabled={!composerDraft.trim()}
+                aria-label="Queue message for next turn"
+                title="Queue (doesn't steer the live turn)"
+                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+              >
+                <ListPlus className="h-4 w-4" />
+              </Button>
               <Button
                 ghost
                 size="icon"
@@ -2055,31 +2062,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               </Button>
             </div>
           )}
-
-          <Button
-            ghost
-            onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
-            className={cn(
-              "absolute z-10",
-              "normal-case tracking-normal font-normal",
-              "rounded border border-current/30",
-              "bg-black/20",
-              "opacity-70 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150",
-              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
-              "lg:bottom-4 lg:right-4",
-            )}
-            style={{ color: terminalFg }}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
-              </span>
-            </span>
-          </Button>
 
           {chatPanelCollapsed && (
             <Button
