@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { Copy, PanelRight, RotateCcw, SendHorizonal, Square, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -223,6 +223,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : null,
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  // Mobile composer: lets touch devices interrupt the running turn and
+  // queue a message without summoning the on-screen keyboard into the
+  // terminal itself. ESC (interrupt) and typed-while-busy (queue) are the
+  // TUI's own bindings — the buttons drive the same paths as a keyboard.
+  const [composerDraft, setComposerDraft] = useState("");
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -509,6 +515,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setCopyState("copied");
     if (copyResetRef.current) clearTimeout(copyResetRef.current);
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+    termRef.current?.focus();
+  };
+
+  // Interrupt the running turn: ESC is the TUI's interrupt binding
+  // (ui-tui useInputHandlers — key.escape aborts the turn). Sent as its
+  // own stdin write so it lands as a keypress, never coalesced.
+  const handleInterrupt = () => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send("\x1b");
+    termRef.current?.focus();
+  };
+
+  // Queue a message: written to the PTY exactly like typed input (burst
+  // then Return, same timing as handleCopyLast). While the agent is busy
+  // the TUI composer queues the text and drains it when the turn ends —
+  // the same queue the desktop app's queued messages land in. Newlines
+  // are collapsed: a multi-line burst risks the middle lines submitting
+  // as separate early submissions (each "\n" is a composer submit).
+  const handleComposerSend = () => {
+    const text = composerDraft.replace(/\s*\n\s*/g, " ").trim();
+    if (!text) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(text);
+    setTimeout(() => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+    }, 100);
+    setComposerDraft("");
     termRef.current?.focus();
   };
 
@@ -1893,6 +1929,50 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+
+          {narrow && (
+            <div className="flex shrink-0 items-end gap-2 border-t border-current/20 px-1 pt-2">
+              <Button
+                ghost
+                size="icon"
+                onClick={handleInterrupt}
+                aria-label="Interrupt the running turn (Esc)"
+                title="Interrupt (Esc)"
+                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+              >
+                <Square className="h-4 w-4" />
+              </Button>
+              <textarea
+                ref={composerInputRef}
+                value={composerDraft}
+                onChange={(e) => setComposerDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleComposerSend();
+                  }
+                }}
+                rows={1}
+                placeholder="Message the agent (queues while busy)"
+                className={cn(
+                  "max-h-24 min-h-[2.25rem] flex-1 resize-none rounded border border-current/20",
+                  "bg-black/30 px-2 py-1.5 text-sm text-midground",
+                  "placeholder:text-text-secondary/60 focus:border-current/40 focus:outline-none",
+                )}
+              />
+              <Button
+                ghost
+                size="icon"
+                onClick={handleComposerSend}
+                disabled={!composerDraft.trim()}
+                aria-label="Send / queue message"
+                title="Send (Enter)"
+                className="h-9 w-9 shrink-0 text-text-secondary hover:text-midground"
+              >
+                <SendHorizonal className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
