@@ -815,6 +815,13 @@ def redact_sensitive_text(
     still run the full regex, which then doesn't match. False negatives
     are impossible because every regex requires the gated substring to
     match.
+
+    Large blocks (>= _REDACT_OFFLOAD_MIN_CHARS) are redacted in a bounded
+    worker process (agent/_gil_offload.py): the URL/credential regexes go
+    super-linear on huge inputs (measured 5.1s of GIL for a 44MB
+    URL-dense call), and this runs on turn threads inside the gateway, so
+    unbounded inline cost stalls the event loop. Results are identical to
+    inline; any pool failure falls back to inline execution.
     """
     if text is None:
         return None
@@ -829,6 +836,42 @@ def redact_sensitive_text(
     # paths either (it's config/data, not log lines).
     if file_read:
         code_file = True
+
+    from agent._gil_offload import DEFAULT_OFFLOAD_MIN_CHARS, offload_text_call
+
+    if len(text) >= DEFAULT_OFFLOAD_MIN_CHARS:
+        offloaded = offload_text_call(
+            "agent.redact._redact_sensitive_text_inline",
+            text,
+            DEFAULT_OFFLOAD_MIN_CHARS,
+            force=force,
+            code_file=code_file,
+            file_read=file_read,
+            redact_url_credentials=redact_url_credentials,
+        )
+        if offloaded is not None:
+            return offloaded
+
+    return _redact_sensitive_text_inline(
+        text,
+        force=force,
+        code_file=code_file,
+        file_read=file_read,
+        redact_url_credentials=redact_url_credentials,
+    )
+
+
+def _redact_sensitive_text_inline(
+    text: str,
+    *,
+    force: bool = False,
+    code_file: bool = False,
+    file_read: bool = False,
+    redact_url_credentials: bool = False,
+) -> str:
+    """Redaction body; also the offload worker's target."""
+    if not (force or _REDACT_ENABLED):
+        return text
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
