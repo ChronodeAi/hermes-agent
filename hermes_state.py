@@ -7794,21 +7794,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # consecutive-abort counter survives process restarts.
 
     def get_compression_abort_streak(self, session_id: str) -> int:
-        """Consecutive commit-fence aborts recorded for *session_id*."""
+        """Consecutive commit-fence aborts recorded for *session_id*.
+
+        Stored in the dedicated ``compression_abort_streaks`` table — never
+        in ``sessions.compression_failure_error`` (that free-text column is
+        overwritten by the cooldown writer on every summary failure, which
+        would silently reset the streak).
+        """
         if not session_id:
             return 0
+
+        def _do(conn):
+            try:
+                row = conn.execute(
+                    "SELECT streak FROM compression_abort_streaks "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                return 0
+            if row is None:
+                return 0
+            return int(row["streak"] if isinstance(row, sqlite3.Row) else row[0])
+
         try:
-            row = self.get_compression_failure_cooldown_row(session_id)
-        except Exception:
-            return 0
-        if not row or not row.get("session_exists"):
-            return 0
-        error = row.get("error") or ""
-        if _COMPRESSION_ABORT_MARKER not in error:
-            return 0
-        try:
-            return int(error.rsplit(_COMPRESSION_ABORT_MARKER, 1)[1].strip().split()[0])
-        except (ValueError, IndexError):
+            return int(self._execute_write(_do) or 0)
+        except sqlite3.Error:
             return 0
 
     def record_compression_abort(self, session_id: str, error: str) -> int:
@@ -7818,32 +7829,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS compression_abort_streaks ("
+                "session_id TEXT PRIMARY KEY, "
+                "streak INTEGER NOT NULL DEFAULT 0, "
+                "updated_at REAL NOT NULL)"
+            )
             row = conn.execute(
-                "SELECT compression_failure_cooldown_until, "
-                "compression_failure_error FROM sessions WHERE id = ?",
+                "SELECT streak FROM compression_abort_streaks "
+                "WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            current = 0
-            if row is not None:
-                existing_error = (
-                    row["compression_failure_error"]
-                    if isinstance(row, sqlite3.Row) else row[1]
-                ) or ""
-                marker = _COMPRESSION_ABORT_MARKER
-                if marker in existing_error:
-                    try:
-                        current = int(
-                            existing_error.rsplit(marker, 1)[1].strip().split()[0]
-                        )
-                    except (ValueError, IndexError):
-                        current = 0
-            new_count = current + 1
+            current = row["streak"] if row is not None else 0
+            new_count = int(current or 0) + 1
             conn.execute(
-                "UPDATE sessions SET compression_failure_error = ? WHERE id = ?",
-                (f"{error} {marker} {new_count}", session_id),
+                "INSERT INTO compression_abort_streaks "
+                "(session_id, streak, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET streak = ?, "
+                "updated_at = ?",
+                (session_id, new_count, now, new_count, now),
             )
             return new_count
 
+        now = time.time()
         return int(self._execute_write(_do) or 0)
 
     def clear_compression_abort_streak(self, session_id: str) -> None:
@@ -7852,22 +7860,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
-            row = conn.execute(
-                "SELECT compression_failure_error FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                return
-            existing = (
-                row["compression_failure_error"]
-                if isinstance(row, sqlite3.Row) else row[0]
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS compression_abort_streaks ("
+                "session_id TEXT PRIMARY KEY, "
+                "streak INTEGER NOT NULL DEFAULT 0, "
+                "updated_at REAL NOT NULL)"
             )
-            if existing and _COMPRESSION_ABORT_MARKER in existing:
-                conn.execute(
-                    "UPDATE sessions SET compression_failure_error = NULL "
-                    "WHERE id = ?",
-                    (session_id,),
-                )
+            conn.execute(
+                "DELETE FROM compression_abort_streaks WHERE session_id = ?",
+                (session_id,),
+            )
 
         try:
             self._execute_write(_do)
@@ -7986,7 +7988,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT COALESCE(MAX(id), 0) FROM messages"
             ).fetchone()[0]
             conn.execute(
-                "UPDATE messages SET active = 0 WHERE id IN (%s)"
+                "UPDATE messages SET active = 0, compacted = 1 WHERE id IN (%s)"
                 % ",".join("?" for _ in middle),
                 tuple(middle),
             )

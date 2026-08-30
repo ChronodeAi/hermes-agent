@@ -2739,32 +2739,26 @@ def _death_spiral_guard(
         db = lock_db
         if db is None:
             return
-        # 1. Size guard: an unboundedly serializable context must not start.
+        # 2. Abort-and-truncate fallback. Record the abort FIRST — even for
+        # oversized sessions (the size refusal at attempt start is what
+        # protects them; the streak must still accumulate so repeated
+        # refusals surface, review finding #1).
+        streak = db.record_compression_abort(
+            session_id, "commit_fence_cancelled"
+        )
         est = int(approx_tokens or 0)
         if (
             est > _COMPRESSION_SIZE_GUARD_TOKENS
             and not getattr(agent, "_compression_death_spiral_exempt", False)
         ):
-            _abort_streak = db.get_compression_abort_streak(session_id)
             logger.error(
-                "compression refused: session=%s estimated_tokens=%d exceeds "
-                "the serialization size guard (%d); run /compress on a "
-                "smaller session or /new — refusing to serialize an "
+                "compression refused (post-abort): session=%s "
+                "estimated_tokens=%d exceeds the serialization size guard "
+                "(%d); abort streak=%d — refusing to re-serialize an "
                 "unbounded context on the gateway process",
                 session_id, est, _COMPRESSION_SIZE_GUARD_TOKENS,
             )
-            _emit_compression_attempt_telemetry(
-                agent,
-                started_at=time.monotonic(),
-                commit_status="aborted",
-                split_status="aborted",
-                failure_class="serialization_size_guard",
-            )
             return
-        # 2. Abort-and-truncate fallback.
-        streak = db.record_compression_abort(
-            session_id, "commit_fence_cancelled"
-        )
         if streak < _COMPRESSION_ABORT_LIMIT:
             return
         logger.error(
@@ -2878,6 +2872,37 @@ def compress_context(
         and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))
     ):
         raise RuntimeError("a compression notification is already pending")
+
+    # ── Size guard at attempt START (adversarial review finding #1) ──────
+    # Refuse BEFORE any serialization when the estimated context exceeds
+    # the guard: the attempt cannot finish within the host budget, so
+    # running it only burns the event loop (2026-08-29 death spiral).
+    # Oversized sessions still recover via the post-abort streak →
+    # hard-truncate path, and manual /compress can exempt via flag.
+    _est_tokens = int(approx_tokens or 0)
+    _size_guard_exempt = getattr(
+        agent, "_compression_death_spiral_exempt", False
+    )
+    if (
+        _est_tokens > _COMPRESSION_SIZE_GUARD_TOKENS
+        and not _size_guard_exempt
+    ):
+        logger.error(
+            "compression refused at attempt start: session=%s "
+            "estimated_tokens=%d exceeds the serialization size guard "
+            "(%d); refusing to serialize an unbounded context on the "
+            "gateway process — run /compress on a smaller session or /new",
+            agent.session_id or "none", _est_tokens,
+            _COMPRESSION_SIZE_GUARD_TOKENS,
+        )
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="serialization_size_guard",
+        )
+        return messages, system_message
 
     # ``conversation_history_after_compression()`` needs the latest attempt's
     # outcome, while ``_last_compaction_in_place`` remains the run-level signal
@@ -3338,6 +3363,7 @@ def compress_context(
                 split_status="aborted",
                 failure_class="commit_fence_cancelled",
             )
+            _death_spiral_guard(agent, _lock_db, _lock_sid, approx_tokens)
             _release_lock()
             return messages, _existing_sp
 
@@ -3909,6 +3935,7 @@ def compress_context(
                     split_status="aborted",
                     failure_class="commit_fence_cancelled",
                 )
+                _death_spiral_guard(agent, _lock_db, _lock_sid, approx_tokens)
                 _release_lock()
                 return messages, _existing_sp
 

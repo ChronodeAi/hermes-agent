@@ -21,6 +21,7 @@
 # than the GIL time it saves — small sessions serialize inline.
 import logging
 import threading
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 from agent.context_compressor import logger  # noqa: E402 — shared module logger
@@ -125,8 +126,33 @@ def _get_summary_serialize_executor():
     global _summary_serialize_executor
     with _summary_serialize_executor_lock:
         if _summary_serialize_executor is None:
-            _summary_serialize_executor = ProcessPoolExecutor(max_workers=1)
+            # Pin "spawn": fork in a heavily threaded gateway process is a
+            # lock-held deadlock lottery (Linux default on py3.11); spawn
+            # also avoids per-restart first-call re-import stalls.
+            _summary_serialize_executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
         return _summary_serialize_executor
+
+
+def _discard_summary_serialize_executor():
+    """Tear down a broken/timed-out pool so the next call rebuilds it.
+
+    Without this, one worker death (OOM while unpickling a giant payload)
+    or one timeout left the pool permanently broken and every later
+    attempt silently reverted to inline serialization — the pre-fix
+    GIL-stall behavior."""
+    global _summary_serialize_executor
+    with _summary_serialize_executor_lock:
+        if _summary_serialize_executor is not None:
+            try:
+                _summary_serialize_executor.shutdown(
+                    wait=False, cancel_futures=True
+                )
+            except Exception:
+                pass
+            _summary_serialize_executor = None
 
 
 def _serialize_for_summary_out_of_process(compressor, turns) -> str:
@@ -163,6 +189,10 @@ def _serialize_for_summary_out_of_process(compressor, turns) -> str:
         future = executor.submit(_summary_serialize_child, state, turns)
         return future.result(timeout=_SUMMARY_SERIALIZE_TIMEOUT_SECONDS)
     except Exception:
+        # The pool may be broken (worker died) or the future timed out with
+        # the worker still grinding — either way, rebuild the pool on the
+        # next attempt instead of letting every future submit fail.
+        _discard_summary_serialize_executor()
         logger.warning(
             "out-of-process summary serialization failed — falling back to "
             "inline serialization",

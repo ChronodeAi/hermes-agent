@@ -24,6 +24,7 @@ import importlib
 import logging
 import os
 import threading
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,12 @@ def _get_executor() -> ProcessPoolExecutor:
     global _executor
     with _executor_lock:
         if _executor is None:
+            # Pin "spawn": fork in a heavily threaded gateway process is
+            # a lock-held deadlock lottery (Linux default on py3.11).
             _executor = ProcessPoolExecutor(
-                max_workers=1, initializer=_child_init
+                max_workers=1,
+                initializer=_child_init,
+                mp_context=multiprocessing.get_context("spawn"),
             )
         return _executor
 

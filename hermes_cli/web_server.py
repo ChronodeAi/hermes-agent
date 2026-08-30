@@ -19655,6 +19655,7 @@ def _install_sighup_resilience() -> bool:
     serving. Main thread only; safe to call more than once.
     """
     import signal as _signal
+    import sys as _sys
     import threading as _threading
     import traceback as _tb
 
@@ -19662,8 +19663,41 @@ def _install_sighup_resilience() -> bool:
         return False
     if _threading.current_thread() is not _threading.main_thread():
         return False
+    # TTY gate (interactive `hermes serve` in a terminal/SSH session): there
+    # SIGHUP on terminal close is the correct "terminal went away" teardown —
+    # log-and-ignore would orphan the backend holding :9119 (next launch
+    # fails the port preflight). Only the headless path (launchd, desktop
+    # child — stdin not a tty) gets SIGHUP resilience.
+    try:
+        if _sys.stdin is not None and _sys.stdin.isatty():
+            _log.info(
+                "SIGHUP resilience not installed: attached to a tty "
+                "(terminal-close semantics preserved)"
+            )
+            return False
+    except (AttributeError, OSError, ValueError):
+        pass  # no real stdin (launchd/daemon) -> install
+    try:
+        prev = _signal.getsignal(_signal.SIGHUP)
+        if callable(prev) and prev not in (_signal.SIG_IGN, _signal.SIG_DFL):
+            _log.debug(
+                "SIGHUP resilience skipped: an existing SIGHUP handler "
+                "(%r) is already installed; not clobbering it",
+                prev,
+            )
+            return False
+    except Exception:
+        pass
+
+    _sighup_last_log = {"t": 0.0}
 
     def _on_sighup(signum, frame):
+        now = time.monotonic()
+        # Rate-limit: a repeated-SIGHUP source must not flood errors.log
+        # with attribution stacks.
+        if now - _sighup_last_log["t"] < 5.0:
+            return
+        _sighup_last_log["t"] = now
         _log.warning(
             "dashboard backend received SIGHUP — ignored (headless; stop via "
             "SIGTERM). attribution stack:\n%s",
@@ -19676,6 +19710,12 @@ def _install_sighup_resilience() -> bool:
     except (ValueError, OSError, RuntimeError) as exc:
         _log.debug("SIGHUP resilience handler not installed: %s", exc)
         return False
+
+
+# Rotate the stack-dump file at install when it exceeds ~25MB (the C-level
+# faulthandler writes directly, so rotation only happens at install time;
+# the stall watchdog's marker lines make per-dump timestamps unnecessary).
+_STACK_DUMP_ROTATE_BYTES = 25 * 1024 * 1024
 
 
 def _install_stack_dump_diagnostics() -> bool:
@@ -19694,29 +19734,37 @@ def _install_stack_dump_diagnostics() -> bool:
     import faulthandler as _fh
     import signal as _signal
     import threading as _threading
-    import time as _time
 
     if not hasattr(_signal, "SIGUSR1"):
         return False
     if _threading.current_thread() is not _threading.main_thread():
-        return False
+        try:
+            prev = _signal.getsignal(_signal.SIGUSR1)
+            if callable(prev) and prev not in (_signal.SIG_IGN, _signal.SIG_DFL):
+                return False  # don't clobber an existing handler
+        except Exception:
+            pass
     try:
         from hermes_constants import get_hermes_home
 
         stacks_path = os.path.join(get_hermes_home(), "logs", "gateway-stacks.log")
         os.makedirs(os.path.dirname(stacks_path), exist_ok=True)
+        # Rotate once at install if a previous life let the file grow huge.
+        try:
+            if os.path.exists(stacks_path) and os.path.getsize(stacks_path) > (
+                _STACK_DUMP_ROTATE_BYTES
+            ):
+                os.replace(stacks_path, stacks_path + ".1")
+        except OSError:
+            pass
         stacks_file = open(stacks_path, "a", encoding="utf-8", buffering=1)
-
-        def _on_sigusr1(signum, frame):
-            stacks_file.write(
-                f"\n==== stack dump {_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"(pid {os.getpid()}) ====\n"
-            )
-            stacks_file.flush()
-            _fh.dump_traceback(file=stacks_file, all_threads=True)
-            stacks_file.flush()
-
-        _signal.signal(_signal.SIGUSR1, _on_sigusr1)
+        # C-level handler (faulthandler.register): runs WITHOUT the GIL at
+        # true delivery time, so a dump lands DURING a GIL-held C stall —
+        # the exact scenario this exists to attribute. A Python-level
+        # handler would defer until the stall ends (defeats the purpose).
+        # Timestamps come from the stall watchdog's own marker lines in
+        # this same file (gateway-stall-watchdog.sh).
+        _fh.register(_signal.SIGUSR1, file=stacks_file, all_threads=True)
         return True
     except (ValueError, OSError, RuntimeError) as exc:
         _log.debug("stack-dump diagnostics not installed: %s", exc)
@@ -19999,6 +20047,7 @@ def start_server(
     except Exception as exc:
         _log.debug("exit-flush signal handlers not installed: %s", exc)
 
+    # Stray SIGHUP silently killed the dashboard backend twice on 2026-08-29
     # (default SIGHUP disposition = terminate; see _install_sighup_resilience).
     # Installed before uvicorn's capture_signals(), which only captures
     # SIGINT/SIGTERM and leaves this handler live for the process lifetime.

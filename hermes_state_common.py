@@ -518,6 +518,17 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- Dedicated consecutive commit-fence abort counter (compression
+-- death-spiral guard). Deliberately NOT encoded into
+-- sessions.compression_failure_error: that free-text column is overwritten
+-- by the cooldown writer on every summary failure, which would silently
+-- reset the streak (adversarial review finding, 2026-08-30).
+CREATE TABLE IF NOT EXISTS compression_abort_streaks (
+    session_id TEXT PRIMARY KEY,
+    streak INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
