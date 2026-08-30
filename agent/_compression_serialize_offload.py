@@ -20,6 +20,7 @@
 # Below this rough token estimate the subprocess round-trip costs more
 # than the GIL time it saves — small sessions serialize inline.
 import logging
+import sys
 import threading
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -51,11 +52,11 @@ def _summary_serialize_child(compressor_state: dict, turns: list) -> str:
 
     return serialize_turns_for_summary(
         turns,
-        content_head=int(compressor_state.get("content_head") or 6000),
-        content_tail=int(compressor_state.get("content_tail") or 2000),
-        content_max=int(compressor_state.get("content_max") or 12000),
-        tool_args_head=int(compressor_state.get("tool_args_head") or 600),
-        tool_args_max=int(compressor_state.get("tool_args_max") or 1200),
+        content_head=int(compressor_state.get("content_head") or 4000),
+        content_tail=int(compressor_state.get("content_tail") or 1500),
+        content_max=int(compressor_state.get("content_max") or 6000),
+        tool_args_head=int(compressor_state.get("tool_args_head") or 1200),
+        tool_args_max=int(compressor_state.get("tool_args_max") or 1500),
     )
 
 
@@ -118,6 +119,10 @@ def _serialize_for_summary_out_of_process(compressor, turns) -> str:
         "tool_args_head": getattr(compressor, "_TOOL_ARGS_HEAD", 1200),
         "tool_args_max": getattr(compressor, "_TOOL_ARGS_MAX", 1500),
     }
+    # stdin/REPL caller: spawn re-imports __main__ and fails without a
+    # file — serialize inline instead (same guard as agent/_gil_offload).
+    if not getattr(sys.modules.get("__main__"), "__file__", None):
+        return compressor._serialize_for_summary(turns)
     logger.info(
         "context compression: serializing ~%d tokens of middle window in a "
         "subprocess (GIL starvation guard)",

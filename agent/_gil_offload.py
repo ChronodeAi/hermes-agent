@@ -23,6 +23,7 @@ point runs inline instead of spawning nested pools.
 import importlib
 import logging
 import os
+import sys
 import threading
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -94,6 +95,12 @@ def offload_text_call(dotted_fn: str, text: str, min_chars: int, **kwargs):
     if not isinstance(text, str) or len(text) < min_chars:
         return None
     if os.environ.get(_CHILD_ENV_MARKER):
+        return None
+    # Interactive/REPL/stdin callers: spawn re-imports __main__, which fails
+    # for stdin-driven code (no file) — every call would spawn, fail, and
+    # fall back inline with noisy stderr. Run inline instead (correct
+    # output, historical cost).
+    if not getattr(sys.modules.get("__main__"), "__file__", None):
         return None
     try:
         executor = _get_executor()

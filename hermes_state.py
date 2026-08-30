@@ -7984,13 +7984,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "WHERE session_id = ? AND active = 1",
                     (session_id,),
                 ).fetchone()[0]
-            single_giant = not middle
+            single_giant = not middle and total_cost > target_tokens and (
+                head_cost + tail_cost >= total_cost
+            )
             marker = (
                 "[SYSTEM: Context truncation — the session exceeded its "
                 "compression threshold and repeated automatic compaction "
-                "attempts aborted, so %s of this conversation was archived "
-                "to keep the session responsive. Nothing was deleted; use "
-                "session search to recover details.]"
+                "attempts aborted, so %s was archived to keep the session "
+                "responsive. Nothing was deleted; use session search to "
+                "recover details.]"
                 % (
                     "the entire oversized transcript"
                     if single_giant

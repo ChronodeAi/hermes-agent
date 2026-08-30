@@ -76,7 +76,8 @@ def test_remote_image_urls_survive_serialization():
     real = ContextCompressor.__new__(ContextCompressor)
     out = real._serialize_for_summary(_sample_turns())
     assert "[image: https://pics.example.com/chart.png]" in out
-    assert "data:image/png;base64" not in out or "[image]" in out
+    assert "[image]" in out  # base64 data URL collapses to the bare marker
+    assert "AAAA" not in out  # the base64 blob itself must not survive
     assert out != real._serialize_for_summary([])
 
 

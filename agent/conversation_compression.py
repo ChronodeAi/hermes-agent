@@ -2873,15 +2873,16 @@ def compress_context(
     ):
         raise RuntimeError("a compression notification is already pending")
 
-    # ── Size guard at attempt START (adversarial review finding #1) ──────
-    # Refuse BEFORE any serialization when the estimated context exceeds
-    # the guard: the attempt cannot finish within the host budget, so
-    # running it only burns the event loop (2026-08-29 death spiral).
-    # Oversized sessions still recover via the post-abort streak →
     # hard-truncate path, and manual /compress can exempt via flag.
+    # Codex app-server sessions are exempt: that route compacts via the
+    # app server's own mechanism and never serializes in-process here
+    # (review-2 finding #1) — refusing them would strand an oversized
+    # context with no compression path at all.
+    _attempt_started_at = time.monotonic()
     _est_tokens = int(approx_tokens or 0)
-    _size_guard_exempt = getattr(
-        agent, "_compression_death_spiral_exempt", False
+    _size_guard_exempt = (
+        getattr(agent, "_compression_death_spiral_exempt", False)
+        or getattr(agent, "api_mode", None) == "codex_app_server"
     )
     if (
         _est_tokens > _COMPRESSION_SIZE_GUARD_TOKENS
@@ -2919,7 +2920,6 @@ def compress_context(
     # it was added in #69870 and is simply idempotent now.
     agent._compression_skipped_due_to_lock = None
 
-    _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
     try:
