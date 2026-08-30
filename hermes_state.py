@@ -7956,12 +7956,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     break
             tail_ids_rev: list[int] = []
             tail_cost = 0
+            # Honor *target_tokens* (review finding #8): the tail keeps as
+            # much of the newest history as fits under the target after the
+            # head, bounded by protect_tail_tokens.
+            tail_budget = max(
+                1000, min(protect_tail_tokens, target_tokens - head_cost)
+            )
             for row in reversed(rows):
                 rid = row["id"]
                 if rid in set(head_ids):
                     break
                 cost = max(1, len(row["content"] or "") // 4)
-                if tail_cost + cost > protect_tail_tokens and tail_ids_rev:
+                if tail_cost + cost > tail_budget and tail_ids_rev:
                     break
                 tail_cost += cost
                 tail_ids_rev.append(rid)
@@ -7969,29 +7975,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # If the kept head + tail already fit the target, nothing to drop.
             keep = set(head_ids) | set(tail_ids)
             middle = [r["id"] for r in rows if r["id"] not in keep]
-            if not middle:
+            total_cost = sum(
+                max(1, len(r["content"] or "") // 4) for r in rows
+            )
+            if not middle and total_cost <= target_tokens:
                 return conn.execute(
                     "SELECT COUNT(*) FROM messages "
                     "WHERE session_id = ? AND active = 1",
                     (session_id,),
                 ).fetchone()[0]
+            single_giant = not middle
             marker = (
                 "[SYSTEM: Context truncation — the session exceeded its "
                 "compression threshold and repeated automatic compaction "
-                "attempts aborted, so the oldest middle portion of this "
-                f"conversation ({len(middle)} messages) was archived to keep "
-                "the session responsive. Nothing was deleted; use session "
-                "search to recover details.]"
+                "attempts aborted, so %s of this conversation was archived "
+                "to keep the session responsive. Nothing was deleted; use "
+                "session search to recover details.]"
+                % (
+                    "the entire oversized transcript"
+                    if single_giant
+                    else f"the oldest middle portion ({len(middle)} messages)"
+                )
             )
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             max_id = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM messages"
             ).fetchone()[0]
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 WHERE id IN (%s)"
-                % ",".join("?" for _ in middle),
-                tuple(middle),
-            )
+            if single_giant:
+                # Single-giant-message shape (review finding #8): head+tail
+                # protection covers every active row yet the transcript still
+                # exceeds target_tokens — previously a no-op and the spiral
+                # continued. Archive the oversized transcript (full text
+                # stays FTS-searchable via compacted=1) and let the marker
+                # become the new opening exchange.
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE id IN (%s)"
+                    % ",".join("?" for _ in middle),
+                    tuple(middle),
+                )
             conn.execute(
                 "INSERT INTO messages "
                 "(id, session_id, role, content, active, timestamp, compacted) "

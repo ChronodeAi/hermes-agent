@@ -24,10 +24,8 @@ import json
 import logging
 import sqlite3
 import re
-import threading
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -2020,6 +2018,113 @@ def _image_part_label(part: Dict[str, Any]) -> str:
     if url.startswith(("http://", "https://")):
         return f"[image: {url}]"
     return "[image]"
+
+
+def serialize_turns_for_summary(
+    turns: List[Dict[str, Any]],
+    *,
+    content_head: int,
+    content_tail: int,
+    content_max: int,
+    tool_args_head: int,
+    tool_args_max: int,
+) -> str:
+    """Serialize conversation turns into labeled text for the summarizer.
+
+    THE single canonical implementation of summarizer-input serialization:
+    used in-process by :meth:`ContextCompressor._serialize_for_summary` and
+    by the out-of-process serialization child (agent/
+    _compression_serialize_offload.py) so the two paths cannot drift.
+
+    All content is redacted before serialization to prevent secrets
+    (API keys, tokens, passwords) from leaking into the summary that gets
+    sent to the auxiliary model and persisted across compactions. Image
+    parts keep a referenceable URL where available (see
+    :func:`_image_part_label`).
+
+    Module-level and knob-parameterized so a worker process can call it
+    from a plain knob dict without any live compressor object.
+    """
+    # Lazy import (matches title_generator.py) — agent_runtime_helpers
+    # pulls in heavy transitive imports we don't want at module load.
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    parts = []
+    for msg in turns:
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif ptype in {"image", "image_url", "input_image"}:
+                        text_parts.append(_image_part_label(part))
+                    else:
+                        # Unknown part type — keep a marker so the
+                        # summarizer knows content existed here.
+                        text_parts.append(f"[{ptype or 'attachment'}]")
+                elif isinstance(part, str):
+                    text_parts.append(part)
+            content = "\n".join(text_parts)
+        content = _redact_compaction_text(content or "")
+        content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
+        # Strip inline reasoning blocks (</think>) from assistant
+        # content before it reaches the summarizer — reasoning traces are
+        # transient scratch work; the native ``reasoning`` message field is
+        # already excluded (only ``content`` is serialized).
+        if role == "assistant" and content:
+            from agent.agent_runtime_helpers import strip_think_blocks
+
+            content = strip_think_blocks(None, content)
+
+        # Tool results: keep enough content for the summarizer
+        if role == "tool":
+            tool_id = msg.get("tool_call_id", "")
+            if len(content) > content_max:
+                content = (
+                    content[:content_head]
+                    + "\n...[truncated]...\n"
+                    + content[-content_tail:]
+                )
+            parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+            continue
+
+        # Assistant messages: include tool call names AND arguments
+        if role == "assistant":
+            if len(content) > content_max:
+                content = (
+                    content[:content_head] + "\n...[truncated]...\n"
+                    + content[-content_tail:]
+                )
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                tc_parts = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "?")
+                        args = _redact_compaction_text(fn.get("arguments", ""))
+                        # Truncate long arguments but keep enough for context
+                        if len(args) > tool_args_max:
+                            args = args[:tool_args_head] + "..."
+                        tc_parts.append(f"  {name}({args})")
+                    else:
+                        fn = getattr(tc, "function", None)
+                        name = getattr(fn, "name", "?") if fn else "?"
+                        tc_parts.append(f"  {name}(...)")
+                content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
+            parts.append(f"[ASSISTANT]: {content}")
+            continue
+
+        # User and other roles
+        if len(content) > content_max:
+            content = content[:content_head] + "\n...[truncated]...\n" + content[-content_tail:]
+        parts.append(f"[{role.upper()}]: {content}")
+
+    return "\n\n".join(parts)
 
 
 def _str_arg(args: dict, key: str, default: str = "") -> str:
@@ -4401,83 +4506,22 @@ class ContextCompressor(ContextEngine):
         All content is redacted before serialization to prevent secrets
         (API keys, tokens, passwords) from leaking into the summary that
         gets sent to the auxiliary model and persisted across compactions.
+
+        Delegates to the module-level :func:`serialize_turns_for_summary` —
+        the single canonical implementation, also used by the
+        out-of-process serialization child (agent/
+        _compression_serialize_offload.py) so the two paths cannot drift
+        (adversarial review finding #5: the duplicated child diverged at
+        birth, hardcoding "[image]" and losing image URLs).
         """
-        # Lazy import (matches title_generator.py) — agent_runtime_helpers
-        # pulls in heavy transitive imports we don't want at module load.
-        from agent.agent_runtime_helpers import strip_think_blocks
-
-        parts = []
-        for msg in turns:
-            role = msg.get("role", "unknown")
-            content = msg.get("content")
-            if isinstance(content, list):
-                text_parts: list[str] = []
-                for part in content:
-                    if isinstance(part, dict):
-                        ptype = part.get("type")
-                        if ptype == "text":
-                            text_parts.append(part.get("text", ""))
-                        elif ptype in {"image", "image_url", "input_image"}:
-                            text_parts.append(_image_part_label(part))
-                        else:
-                            # Unknown part type — keep a marker so the
-                            # summarizer knows content existed here.
-                            text_parts.append(f"[{ptype or 'attachment'}]")
-                    elif isinstance(part, str):
-                        text_parts.append(part)
-                content = "\n".join(text_parts)
-            content = _redact_compaction_text(content or "")
-            content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
-            # Strip inline reasoning blocks (<think>, <reasoning>, etc.) from
-            # assistant content before it reaches the summarizer. Reasoning
-            # traces are transient scratch work — feeding them to the aux
-            # model wastes summarizer context and risks scratch-work
-            # conclusions being preserved as facts in the summary. The native
-            # ``reasoning`` message field is already excluded (only
-            # ``content`` is serialized); this closes the inline-tag path
-            # used when native thinking is disabled or the provider inlines
-            # traces into content.
-            if role == "assistant" and content:
-                content = strip_think_blocks(None, content)
-
-            # Tool results: keep enough content for the summarizer
-            if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-                continue
-
-            # Assistant messages: include tool call names AND arguments
-            if role == "assistant":
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                tool_calls = msg.get("tool_calls", [])
-                if tool_calls:
-                    tc_parts = []
-                    for tc in tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = _redact_compaction_text(fn.get("arguments", ""))
-                            # Truncate long arguments but keep enough for context
-                            if len(args) > self._TOOL_ARGS_MAX:
-                                args = args[:self._TOOL_ARGS_HEAD] + "..."
-                            tc_parts.append(f"  {name}({args})")
-                        else:
-                            fn = getattr(tc, "function", None)
-                            name = getattr(fn, "name", "?") if fn else "?"
-                            tc_parts.append(f"  {name}(...)")
-                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
-                continue
-
-            # User and other roles
-            if len(content) > self._CONTENT_MAX:
-                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-            parts.append(f"[{role.upper()}]: {content}")
-
-        return "\n\n".join(parts)
+        return serialize_turns_for_summary(
+            turns,
+            content_head=self._CONTENT_HEAD,
+            content_tail=self._CONTENT_TAIL,
+            content_max=self._CONTENT_MAX,
+            tool_args_head=self._TOOL_ARGS_HEAD,
+            tool_args_max=self._TOOL_ARGS_MAX,
+        )
 
     def _build_static_fallback_summary(
         self,

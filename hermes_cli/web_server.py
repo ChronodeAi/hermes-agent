@@ -19747,6 +19747,24 @@ def _install_stack_dump_diagnostics() -> bool:
     try:
         from hermes_constants import get_hermes_home
 
+        # Bail loudly if a previous SIGUSR1 handler exists: SIGUSR1 is the
+        # documented drain-then-restart signal for hermes *gateway*
+        # processes (gateway/run.py), and clobbering one here would turn
+        # any future PID-resolution slip into silent stack dumps instead
+        # of restarts (review finding #16). faulthandler.register's
+        # sigaction-level handler is invisible to getsignal, so a SIG_DFL
+        # reading is the expected "nothing else owns this" state.
+        prev = _signal.getsignal(_signal.SIGUSR1)
+        if callable(prev) and prev not in (
+            _signal.SIG_IGN,
+            _signal.SIG_DFL,
+        ):
+            _log.warning(
+                "SIGUSR1 stack-dump diagnostics not installed: an existing "
+                "SIGUSR1 handler (%r) is already installed; refusing to "
+                "clobber it", prev,
+            )
+            return False
         stacks_path = os.path.join(get_hermes_home(), "logs", "gateway-stacks.log")
         os.makedirs(os.path.dirname(stacks_path), exist_ok=True)
         # Rotate once at install if a previous life let the file grow huge.

@@ -46,13 +46,20 @@ def _hammer_iteration(payload: dict) -> int:
     """One gateway turn-path heavy iteration (module-level: picklable).
 
     Mirrors what a session turn does in-process: serialize a large
-    tool-result frame, parse it back, run the compaction redaction regex.
+    tool-result frame, parse it back, run the compaction redaction
+    regex. Uses the INLINE redaction body directly — this test exists to
+    measure the GIL cost of in-process work, so the structural fix under
+    test (offloading) must not be silently in play here.
     """
-    from agent.context_compressor import _redact_compaction_text
+    from agent.redact import _redact_sensitive_text_inline
 
     line = json.dumps(payload, ensure_ascii=False)
     restored = json.loads(line)
-    return len(_redact_compaction_text(restored["params"]["output"]))
+    return len(
+        _redact_sensitive_text_inline(
+            restored["params"]["output"], force=True
+        )
+    )
 
 
 def _measure_max_tick_gap(mode: str) -> float:

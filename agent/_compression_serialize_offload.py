@@ -37,89 +37,26 @@ _summary_serialize_executor_lock = threading.Lock()
 
 
 def _summary_serialize_child(compressor_state: dict, turns: list) -> str:
-    """Subprocess entry: serialize turns exactly as
-    ContextCompressor._serialize_for_summary does, from a plain knob dict.
+    """Subprocess entry: serialize turns with the ONE canonical
+    implementation (agent.context_compressor.serialize_turns_for_summary).
 
     ``compressor_state`` carries only the knobs the serializer reads, so no
-    live compressor object (DB handles, provider clients) is pickled.
-    The redaction/think-strip helpers are re-imported from the live module
-    inside the child, so behavior stays pinned to the real implementation.
+    live compressor object (DB handles, provider clients) is pickled. The
+    function is imported by dotted path inside the child, so behavior is
+    pinned to the real implementation by construction — the duplicated
+    loop this once carried diverged at birth ("[image]" vs URL-preserving
+    labels; adversarial review finding #5).
     """
-    from agent.context_compressor import _redact_compaction_text
-    from agent.context_compressor import _MEDIA_DIRECTIVE_RE
-    from agent.agent_runtime_helpers import strip_think_blocks
+    from agent.context_compressor import serialize_turns_for_summary
 
-    parts: list = []
-    content_head = int(compressor_state.get("content_head") or 6000)
-    content_tail = int(compressor_state.get("content_tail") or 2000)
-    content_max = int(compressor_state.get("content_max") or 12000)
-    tool_args_head = int(compressor_state.get("tool_args_head") or 600)
-    tool_args_max = int(compressor_state.get("tool_args_max") or 1200)
-    for msg in turns:
-        role = msg.get("role", "unknown")
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts: list = []
-            for part in content:
-                if isinstance(part, dict):
-                    ptype = part.get("type")
-                    if ptype == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif ptype in {"image", "image_url", "input_image"}:
-                        text_parts.append("[image]")
-                    else:
-                        text_parts.append(f"[{ptype or 'attachment'}]")
-                elif isinstance(part, str):
-                    text_parts.append(part)
-            content = "\n".join(text_parts)
-        content = _redact_compaction_text(content or "")
-        content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
-        if role == "assistant" and content:
-            content = strip_think_blocks(None, content)
-
-        if role == "tool":
-            tool_id = msg.get("tool_call_id", "")
-            if len(content) > content_max:
-                content = (
-                    content[:content_head] + "\n...[truncated]...\n"
-                    + content[-content_tail:]
-                )
-            parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-            continue
-
-        if role == "assistant":
-            if len(content) > content_max:
-                content = (
-                    content[:content_head] + "\n...[truncated]...\n"
-                    + content[-content_tail:]
-                )
-            tool_calls = msg.get("tool_calls", [])
-            if tool_calls:
-                tc_parts = []
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        fn = tc.get("function", {})
-                        name = fn.get("name", "?")
-                        args = _redact_compaction_text(fn.get("arguments", ""))
-                        if len(args) > tool_args_max:
-                            args = args[:tool_args_head] + "..."
-                        tc_parts.append(f"  {name}({args})")
-                    else:
-                        fn = getattr(tc, "function", None)
-                        name = getattr(fn, "name", "?") if fn else "?"
-                        tc_parts.append(f"  {name}(...)")
-                content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-            parts.append(f"[ASSISTANT]: {content}")
-            continue
-
-        if len(content) > content_max:
-            content = (
-                content[:content_head] + "\n...[truncated]...\n"
-                + content[-content_tail:]
-            )
-        parts.append(f"[{role.upper()}]: {content}")
-
-    return "\n\n".join(parts)
+    return serialize_turns_for_summary(
+        turns,
+        content_head=int(compressor_state.get("content_head") or 6000),
+        content_tail=int(compressor_state.get("content_tail") or 2000),
+        content_max=int(compressor_state.get("content_max") or 12000),
+        tool_args_head=int(compressor_state.get("tool_args_head") or 600),
+        tool_args_max=int(compressor_state.get("tool_args_max") or 1200),
+    )
 
 
 def _get_summary_serialize_executor():
@@ -173,11 +110,13 @@ def _serialize_for_summary_out_of_process(compressor, turns) -> str:
     if est < _OUT_OF_PROCESS_SERIALIZATION_MIN_TOKENS:
         return compressor._serialize_for_summary(turns)
     state = {
-        "content_head": getattr(compressor, "_CONTENT_HEAD", 6000),
-        "content_tail": getattr(compressor, "_CONTENT_TAIL", 2000),
-        "content_max": getattr(compressor, "_CONTENT_MAX", 12000),
-        "tool_args_head": getattr(compressor, "_TOOL_ARGS_HEAD", 600),
-        "tool_args_max": getattr(compressor, "_TOOL_ARGS_MAX", 1200),
+        # Defaults mirror ContextCompressor's class constants so a
+        # knob-less compressor still serializes identically.
+        "content_head": getattr(compressor, "_CONTENT_HEAD", 4000),
+        "content_tail": getattr(compressor, "_CONTENT_TAIL", 1500),
+        "content_max": getattr(compressor, "_CONTENT_MAX", 6000),
+        "tool_args_head": getattr(compressor, "_TOOL_ARGS_HEAD", 1200),
+        "tool_args_max": getattr(compressor, "_TOOL_ARGS_MAX", 1500),
     }
     logger.info(
         "context compression: serializing ~%d tokens of middle window in a "
