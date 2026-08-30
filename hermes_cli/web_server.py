@@ -19678,6 +19678,51 @@ def _install_sighup_resilience() -> bool:
         return False
 
 
+def _install_stack_dump_diagnostics() -> bool:
+    """SIGUSR1 -> append an all-thread Python traceback to a forensic file.
+
+    The gateway's loop watchdog only reports "event loop stalled Ns (GIL
+    pressure suspected)" — it cannot name the frames holding the GIL.
+    Session turns and tool orchestration run as in-process daemon threads
+    (tui_gateway/server.py), so any CPU-bound work in those threads stalls
+    the event loop. ``faulthandler`` lets an operator dump every thread's
+    exact Python stack WITHOUT root (py-spy needs it on macOS), turning the
+    next stall storm into named evidence. Dumps append to
+    ``$HERMES_HOME/logs/gateway-stacks.log``; the handler is passive — it
+    never alters process behavior.
+    """
+    import faulthandler as _fh
+    import signal as _signal
+    import threading as _threading
+    import time as _time
+
+    if not hasattr(_signal, "SIGUSR1"):
+        return False
+    if _threading.current_thread() is not _threading.main_thread():
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+
+        stacks_path = os.path.join(get_hermes_home(), "logs", "gateway-stacks.log")
+        os.makedirs(os.path.dirname(stacks_path), exist_ok=True)
+        stacks_file = open(stacks_path, "a", encoding="utf-8", buffering=1)
+
+        def _on_sigusr1(signum, frame):
+            stacks_file.write(
+                f"\n==== stack dump {_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"(pid {os.getpid()}) ====\n"
+            )
+            stacks_file.flush()
+            _fh.dump_traceback(file=stacks_file, all_threads=True)
+            stacks_file.flush()
+
+        _signal.signal(_signal.SIGUSR1, _on_sigusr1)
+        return True
+    except (ValueError, OSError, RuntimeError) as exc:
+        _log.debug("stack-dump diagnostics not installed: %s", exc)
+        return False
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -19954,11 +19999,15 @@ def start_server(
     except Exception as exc:
         _log.debug("exit-flush signal handlers not installed: %s", exc)
 
-    # Stray SIGHUP silently killed the dashboard backend twice on 2026-08-29
     # (default SIGHUP disposition = terminate; see _install_sighup_resilience).
     # Installed before uvicorn's capture_signals(), which only captures
     # SIGINT/SIGTERM and leaves this handler live for the process lifetime.
     _install_sighup_resilience()
+
+    # Forensics: SIGUSR1 appends an all-thread Python traceback to
+    # $HERMES_HOME/logs/gateway-stacks.log so stall storms can be attributed
+    # to exact frames without root. Passive — never changes behavior.
+    _install_stack_dump_diagnostics()
 
     # ── #93608: machine-readable port-conflict detection ──────────────
     # uvicorn's own bind_socket() would catch the EADDRINUSE and exit 1
