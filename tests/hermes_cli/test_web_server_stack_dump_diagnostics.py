@@ -68,8 +68,10 @@ def test_installs_and_dumps_all_threads(stacks_log):
         )
     finally:
         import faulthandler
+        from hermes_cli import web_server as _ws
 
         faulthandler.unregister(signal.SIGUSR1)
+        _ws._stack_dump_installed = False
 
 
 _OBSERVER_SCRIPT = """
@@ -129,6 +131,9 @@ def test_dump_lands_during_gil_held_c_call(stacks_log):
             faulthandler.unregister(signal.SIGUSR1)
         except (ValueError, RuntimeError):
             pass
+        from hermes_cli import web_server as _ws
+
+        _ws._stack_dump_installed = False
 
 
 def test_off_thread_install_is_allowed_or_cleanly_refused(tmp_path, monkeypatch):

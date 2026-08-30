@@ -3,18 +3,21 @@
 redact_sensitive_text on blocks >= ~1M chars must run in the bounded
 worker pool (agent/_gil_offload.py) instead of holding the GIL inline:
 measured 5.1s of GIL for one 44MB URL-dense call (super-linear regex
-worst case). Tests: result equivalence with inline execution, loop
-responsiveness during a large redaction, inline fallback for small
-texts and pool failures, and the no-nested-pool guard in offload
-children.
+worst case). Tests: structural proof the pool is used (F11), result
+equivalence with inline execution, loop responsiveness during a large
+redaction, inline fallback for small texts and pool failures, and the
+no-nested-pool guard in offload children.
 """
 
 import asyncio
 import contextlib
-import time
+import concurrent.futures as cf
+
+import concurrent.futures as cf
 
 import pytest
 
+import agent._gil_offload as off
 import agent.redact as r
 from agent._gil_offload import DEFAULT_OFFLOAD_MIN_CHARS
 from agent.redact import _redact_sensitive_text_inline, redact_sensitive_text
@@ -32,12 +35,9 @@ def test_small_text_stays_inline(monkeypatch):
         raise AssertionError("offload must not be attempted for small text")
 
     monkeypatch.setattr("agent._gil_offload.offload_text_call", _fail)
-    try:
-        assert r.redact_sensitive_text("hello world") == "hello world"
-        assert r.redact_sensitive_text(None) is None
-        assert r.redact_sensitive_text("") == ""
-    finally:
-        monkeypatch.undo()
+    assert r.redact_sensitive_text("hello world") == "hello world"
+    assert r.redact_sensitive_text(None) is None
+    assert r.redact_sensitive_text("") == ""
 
 
 @pytest.mark.parametrize(
@@ -58,27 +58,55 @@ def test_dispatcher_matches_inline_exactly(text, kwargs):
     ) == r._redact_sensitive_text_inline(text, **kwargs)
 
 
-def test_large_text_offloads_and_matches_inline():
-    text = _url_heavy_text(2.0)  # ~4.3M chars — over the threshold
+def test_large_text_offloads_and_matches_inline(monkeypatch):
+    """F11 (review-2): dispatcher == inline holds whether or not the
+    offload ran, so assert STRUCTURALLY that a pool submission happened -
+    deleting the offload must fail this test, not just the timing one."""
+    submitted = {"n": 0}
+
+    class _SpyPool:
+        def __init__(self, *a, **k):
+            self._inner = cf.ProcessPoolExecutor(*a, **k)
+
+        def submit(self, fn, *a, **k):
+            submitted["n"] += 1
+            return self._inner.submit(fn, *a, **k)
+
+        def shutdown(self, *a, **k):
+            return self._inner.shutdown(*a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(off, "ProcessPoolExecutor", _SpyPool)
+    # A pool cached by an earlier test would bypass the spy - force a
+    # fresh executor under the spy.
+    monkeypatch.setattr(off, "_executor", None)
+    text = _url_heavy_text(2.0)  # ~4.3M chars - over the threshold
     assert len(text) >= DEFAULT_OFFLOAD_MIN_CHARS
+
     via_dispatcher = r.redact_sensitive_text(text, redact_url_credentials=True)
     inline = _redact_sensitive_text_inline(
         text, force=True, redact_url_credentials=True
     )
     assert via_dispatcher == inline
     assert via_dispatcher != text  # actually redacted something
+    assert submitted["n"] >= 1, (
+        "dispatcher must have submitted to the worker pool for oversized "
+        "text (offload deleted -> this fails structurally)"
+    )
 
 
 def test_loop_stays_responsive_during_large_redaction():
     """The choke-point fix: redacting URL-dense multi-MB text from a
     turn-like thread must not stall the event loop (previously a single
     44MB call held the GIL for 5.1s)."""
+    import time
+
     text = _url_heavy_text(40)  # ~42M chars
-    gaps: list[float] = []
+    gaps = []
 
     async def main():
-        stop_task_holder = {}
-
         async def ticker():
             last = time.perf_counter()
             while True:
@@ -89,9 +117,6 @@ def test_loop_stays_responsive_during_large_redaction():
 
         tick = asyncio.create_task(ticker())
         try:
-            # Turn-thread analogue: the blocking redaction call runs in a
-            # worker thread; the dispatcher must release the GIL by waiting
-            # on the pool future, keeping the loop at its 20ms cadence.
             await asyncio.to_thread(
                 r.redact_sensitive_text, text, redact_url_credentials=True
             )
@@ -112,34 +137,30 @@ def test_loop_stays_responsive_during_large_redaction():
 
 def test_offload_child_runs_inline(monkeypatch):
     """Inside an offload child (env marker), the dispatcher must not spawn
-    a nested pool — offload_text_call short-circuits before any pool use."""
+    a nested pool - offload_text_call short-circuits before any pool use."""
 
     def _fail(*a, **k):
         raise AssertionError("child guard failed: executor was reached")
 
     monkeypatch.setenv("_HERMES_GIL_OFFLOAD_CHILD", "1")
     monkeypatch.setattr("agent._gil_offload._get_executor", _fail)
-    try:
-        text = _url_heavy_text(2.0)  # over threshold; guard must skip pool
-        result = r.redact_sensitive_text(text, redact_url_credentials=True)
-        assert result is not None and result != text  # real inline result
-    finally:
-        monkeypatch.undo()
+    text = _url_heavy_text(2.0)  # over threshold; guard must skip pool
+    result = r.redact_sensitive_text(text, redact_url_credentials=True)
+    assert result is not None and result != text  # real inline result
 
 
 def test_pool_failure_falls_back_inline(monkeypatch):
-    """A broken pool degrades to inline — correct output, old worst case."""
+    """A broken pool degrades to inline - correct output, old worst case."""
 
     class _Broken:
         def submit(self, *a, **k):
             raise BrokenProcessPool("simulated")
 
     monkeypatch.setattr("agent._gil_offload._get_executor", lambda: _Broken())
-    try:
-        text = _url_heavy_text(2.0)
-        out = r.redact_sensitive_text(text, redact_url_credentials=True)
-        assert out == _redact_sensitive_text_inline(
-            text, force=True, redact_url_credentials=True
-        )
-    finally:
-        monkeypatch.undo()
+    text = _url_heavy_text(2.0)
+    out = r.redact_sensitive_text(text, redact_url_credentials=True)
+    assert out == _redact_sensitive_text_inline(
+        text, force=True, redact_url_credentials=True
+    )
+
+

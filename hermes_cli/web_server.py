@@ -19717,6 +19717,11 @@ def _install_sighup_resilience() -> bool:
 # the stall watchdog's marker lines make per-dump timestamps unnecessary).
 _STACK_DUMP_ROTATE_BYTES = 25 * 1024 * 1024
 
+# Guard against re-registration in the same process: faulthandler chains
+# per-signal handlers invisibly (getsignal cannot see the C registration),
+# so a second install would produce duplicate dumps. (review-2 F9)
+_stack_dump_installed = False
+
 
 def _install_stack_dump_diagnostics() -> bool:
     """SIGUSR1 -> append an all-thread Python traceback to a forensic file.
@@ -19735,11 +19740,13 @@ def _install_stack_dump_diagnostics() -> bool:
     import signal as _signal
     import threading as _threading
 
+    global _stack_dump_installed
+    if _stack_dump_installed:
+        return True
     if not hasattr(_signal, "SIGUSR1"):
         return False
     if _threading.current_thread() is not _threading.main_thread():
         try:
-            prev = _signal.getsignal(_signal.SIGUSR1)
             if callable(prev) and prev not in (_signal.SIG_IGN, _signal.SIG_DFL):
                 return False  # don't clobber an existing handler
         except Exception:
@@ -19755,6 +19762,15 @@ def _install_stack_dump_diagnostics() -> bool:
         # sigaction-level handler is invisible to getsignal, so a SIG_DFL
         # reading is the expected "nothing else owns this" state.
         prev = _signal.getsignal(_signal.SIGUSR1)
+        if prev is _signal.SIG_IGN or (
+            callable(prev) and prev is not _signal.SIG_DFL
+        ):
+            _log.warning(
+                "SIGUSR1 stack-dump diagnostics not installed: an existing "
+                "SIGUSR1 disposition (%r) is already present; refusing to "
+                "clobber it", prev,
+            )
+            return False
         if callable(prev) and prev not in (
             _signal.SIG_IGN,
             _signal.SIG_DFL,
@@ -19783,6 +19799,7 @@ def _install_stack_dump_diagnostics() -> bool:
         # Timestamps come from the stall watchdog's own marker lines in
         # this same file (gateway-stall-watchdog.sh).
         _fh.register(_signal.SIGUSR1, file=stacks_file, all_threads=True)
+        _stack_dump_installed = True
         return True
     except (ValueError, OSError, RuntimeError) as exc:
         _log.debug("stack-dump diagnostics not installed: %s", exc)

@@ -7958,13 +7958,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             tail_cost = 0
             # Honor *target_tokens* (review finding #8): the tail keeps as
             # much of the newest history as fits under the target after the
-            # head, bounded by protect_tail_tokens.
+            # head, bounded by protect_tail_tokens. When the head alone
+            # already exceeds the target the budget floors at 1000 — kept
+            # context can then still exceed the target (review-2 F3); the
+            # completion log below surfaces kept-vs-target so that
+            # degradation is observable, not silent.
             tail_budget = max(
                 1000, min(protect_tail_tokens, target_tokens - head_cost)
             )
+            head_id_set = set(head_ids)
             for row in reversed(rows):
                 rid = row["id"]
-                if rid in set(head_ids):
+                if rid in head_id_set:
                     break
                 cost = max(1, len(row["content"] or "") // 4)
                 if tail_cost + cost > tail_budget and tail_ids_rev:
@@ -7978,13 +7983,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             total_cost = sum(
                 max(1, len(r["content"] or "") // 4) for r in rows
             )
-            if not middle and total_cost <= target_tokens:
+            # The transcript already fits the target — archive nothing,
+            # regardless of whether the protection windows left a middle
+            # (review-2 F2: empirically, an under-target transcript was
+            # archived because tail_budget is capped at protect_tail_tokens
+            # and the only early return checked middle emptiness).
+            if total_cost <= target_tokens:
+                # Log the no-op loudly: the caller will clear the streak and
+                # set a cooldown believing a truncation ran — it must be able
+                # to tell "already fits" apart from a real truncation.
+                logger.info(
+                    "hard_truncate_middle_window(%s): transcript already "
+                    "fits the target (~%d tokens <= target %d); nothing "
+                    "archived",
+                    session_id, total_cost, target_tokens,
+                )
                 return conn.execute(
                     "SELECT COUNT(*) FROM messages "
                     "WHERE session_id = ? AND active = 1",
                     (session_id,),
                 ).fetchone()[0]
-            single_giant = not middle and total_cost > target_tokens and (
+            single_giant = not middle and (
                 head_cost + tail_cost >= total_cost
             )
             marker = (
@@ -8003,25 +8022,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             max_id = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM messages"
             ).fetchone()[0]
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            max_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
             if single_giant:
                 # Single-giant-message shape (review finding #8): head+tail
                 # protection covers every active row yet the transcript still
                 # exceeds target_tokens — previously a no-op and the spiral
                 # continued. Archive the oversized transcript (full text
                 # stays FTS-searchable via compacted=1) and let the marker
-                # become the new opening exchange.
-                conn.execute(
+                # become the new opening exchange. Report the REAL archived
+                # count, not len(middle) (which is empty here — review-2 F6).
+                cur = conn.execute(
                     "UPDATE messages SET active = 0, compacted = 1 "
                     "WHERE session_id = ? AND active = 1",
                     (session_id,),
                 )
+                archived_count = cur.rowcount
             else:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE messages SET active = 0, compacted = 1 "
                     "WHERE id IN (%s)"
                     % ",".join("?" for _ in middle),
                     tuple(middle),
                 )
+                archived_count = cur.rowcount
             conn.execute(
                 "INSERT INTO messages "
                 "(id, session_id, role, content, active, timestamp, compacted) "
@@ -8038,10 +8064,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     session_id,
                     time.time() + 900,
-                    f"{reason}: truncated {len(middle)} messages at {now_iso}",
+                    f"{reason}: truncated {archived_count} messages "
+                    f"(~{total_cost - (head_cost + tail_cost)} tokens "
+                    f"archived, kept ~{head_cost + tail_cost} of "
+                    f"{total_cost}; target {target_tokens}) at {now_iso}",
                     session_id,
                 ),
             )
+            return conn.execute(
+                "SELECT COUNT(*) FROM messages "
+                "WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()[0]
             return conn.execute(
                 "SELECT COUNT(*) FROM messages "
                 "WHERE session_id = ? AND active = 1",

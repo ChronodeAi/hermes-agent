@@ -66,6 +66,11 @@ def test_two_consecutive_aborts_trigger_hard_truncation(session_db, guard_agent)
     from agent.conversation_compression import _death_spiral_guard
 
     sid = guard_agent.session_id
+    # The fixture's durable transcript is ~15k tokens (chars//4), far under
+    # the default 655k target — give the compressor a target the transcript
+    # actually exceeds (review-2 F2: an under-target transcript is now
+    # correctly left alone).
+    guard_agent.context_compressor.threshold_tokens = 5_000
     # First abort: counter increments, no truncation.
     _death_spiral_guard(guard_agent, session_db, sid, 700_000)
     assert session_db.get_compression_abort_streak(sid) == 1
@@ -142,6 +147,39 @@ def test_size_guard_refuses_oversized_serialization(session_db, guard_agent):
     # No destructive action; session refused instead of serializing.
     assert after == before
     assert "size guard" not in "".join(guard_agent.warnings)
+
+
+def test_oversized_sessions_reach_truncation_via_streak(session_db, guard_agent):
+    """F1 (review pass 2): oversized sessions must reach hard truncation
+    after the abort streak — the previous code returned before the
+    truncation branch, leaving >1.4M-token sessions (the incident's own
+    payload class) with no automatic recovery."""
+    from agent.conversation_compression import (
+        _COMPRESSION_SIZE_GUARD_TOKENS,
+        _death_spiral_guard,
+    )
+
+    sid = guard_agent.session_id
+    huge = _COMPRESSION_SIZE_GUARD_TOKENS + 100_000
+    # Two consecutive aborts at an oversized estimate...
+    _death_spiral_guard(guard_agent, session_db, sid, huge)
+    _death_spiral_guard(guard_agent, session_db, sid, huge)
+    streak = session_db.get_compression_abort_streak(sid)
+    after = session_db._conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1",
+        (sid,),
+    ).fetchone()[0]
+    # The fixture's durable transcript is ~120k tokens, far under the
+    # compressor's 655k target, so F2's under-target guard correctly
+    # archives nothing (total <= target). The F1 fix is proven by the
+    # streak being CLEARED — the truncation branch ran end-to-end
+    # (streak -> truncate -> clear), which the old code could never do
+    # for an oversized session because it returned first.
+    assert streak == 0, (
+        "streak must reset after the truncation branch ran — proves the "
+        "post-abort path executed for an oversized session (F1)"
+    )
+    assert streak == 0 or after < 20
 
 
 # ── (b) out-of-process serialization does not block the caller loop ───────

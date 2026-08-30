@@ -2747,25 +2747,21 @@ def _death_spiral_guard(
             session_id, "commit_fence_cancelled"
         )
         est = int(approx_tokens or 0)
-        if (
-            est > _COMPRESSION_SIZE_GUARD_TOKENS
-            and not getattr(agent, "_compression_death_spiral_exempt", False)
-        ):
-            logger.error(
-                "compression refused (post-abort): session=%s "
-                "estimated_tokens=%d exceeds the serialization size guard "
-                "(%d); abort streak=%d — refusing to re-serialize an "
-                "unbounded context on the gateway process",
-                session_id, est, _COMPRESSION_SIZE_GUARD_TOKENS,
-            )
-            return
+        # Oversized sessions DO reach this fallback: serialization is
+        # refused (that is the whole point of the size guard — F1,
+        # review pass 2) but hard_truncate_middle_window is DB-only and
+        # never serializes, so it is exactly the recovery path for them.
+        # Do not return before it for oversized sessions.
         if streak < _COMPRESSION_ABORT_LIMIT:
             return
         logger.error(
             "compression death spiral detected: session=%s has aborted %d "
-            "consecutive attempts — forcing a hard truncation instead of a "
-            "3rd attempt",
+            "consecutive attempts%s — forcing a hard truncation instead of "
+            "a 3rd attempt",
             session_id, streak,
+            " (estimated_tokens=%d, oversized)" % est
+            if est > _COMPRESSION_SIZE_GUARD_TOKENS
+            else "",
         )
         try:
             agent._emit_warning(
