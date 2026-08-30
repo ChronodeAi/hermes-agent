@@ -788,6 +788,7 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
 def should_require_dashboard_auth(
     host: str,
     trusted_public_hosts: Optional[frozenset[str]] = None,
+    desktop_spawn: bool = False,
 ) -> bool:
     """Return whether the dashboard auth gate must be active.
 
@@ -795,10 +796,30 @@ def should_require_dashboard_auth(
     ``dashboard.public_url`` requires authentication even when a reverse proxy
     reaches a backend bound to loopback. Callers may pass the already-resolved
     host set so startup and request validation use the same snapshot.
+
+    ``desktop_spawn`` marks a backend the desktop app launched for its own
+    private use (``HERMES_DESKTOP=1``). On a loopback bind such a backend is
+    process-private and the ``public_url`` arm must NOT engage: the credential
+    it speaks is a single-client token handed over the spawn env, the SPA is
+    never mounted (headless ``serve``), and no browser-facing URL points at
+    its ephemeral OS-assigned port — there is no SPA token to leak through a
+    proxy, and the operator's ``public_url`` describes *their* dashboard
+    deployment, not this child. Without the exemption, any desktop user who
+    configures ``public_url`` for a real dashboard elsewhere gates this
+    loopback child too, and the app's legacy ``?token=`` WS credential is
+    rejected — the desktop fails to boot entirely (observed 2026-08-30). The
+    bind arm is unaffected: a desktop-spawned backend on a non-loopback bind
+    still gates.
     """
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
-    return should_require_auth(host) or any(
+    bind_requires = should_require_auth(host)
+    if desktop_spawn and not bind_requires:
+        # Desktop-spawned loopback backend — see docstring. The bind itself
+        # doesn't require auth, and the public-hosts arm does not apply to a
+        # process-private child.
+        return False
+    return bind_requires or any(
         candidate not in _LOOPBACK_HOST_VALUES
         for candidate in trusted_public_hosts
     )
@@ -19859,9 +19880,18 @@ def start_server(
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.
+    _desktop_spawn = os.getenv("HERMES_DESKTOP") == "1"
     app.state.auth_required = should_require_dashboard_auth(
-        host, app.state.trusted_public_hosts
+        host, app.state.trusted_public_hosts, desktop_spawn=_desktop_spawn
     )
+    if _desktop_spawn and not app.state.auth_required and host in _LOOPBACK_HOST_VALUES:
+        # Operator-visible so a desktop "WS rejected the session token" report
+        # can be triaged against the actual gate decision at startup.
+        _log.info(
+            "Desktop-spawned loopback backend: dashboard.public_url gate not "
+            "engaged (process-private serve; token auth via X-Hermes-Session-Token "
+            "and /api/ws?token=)."
+        )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

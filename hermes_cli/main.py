@@ -11704,6 +11704,9 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
     when:
       * neither the bind nor configured public URL engages the gate, or
+      * this is a desktop-spawned loopback backend (``HERMES_DESKTOP=1``) — the
+        ``public_url`` arm does not apply to the app's process-private child,
+        or
       * a provider is already registered, or
       * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
     """
@@ -11711,7 +11714,9 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     try:
         from hermes_cli.web_server import should_require_dashboard_auth
-        if not should_require_dashboard_auth(host):
+        if not should_require_dashboard_auth(
+            host, desktop_spawn=os.getenv("HERMES_DESKTOP") == "1"
+        ):
             return  # local-only bind and URL — gate does not engage
     except Exception:
         return  # if we can't tell, defer to start_server's own gate
